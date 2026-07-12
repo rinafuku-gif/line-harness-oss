@@ -23,6 +23,8 @@ import {
 import type { EntryRoute, Friend } from '@line-crm/db';
 import { fireEvent } from '../services/event-bus.js';
 import { buildMessage, expandVariables } from '../services/step-delivery.js';
+import { invokeLLM, isConsultationRateLimited } from '../services/llm.js';
+import { buildConsultationPrompt } from '../services/consultationPrompt.js';
 import type { Env } from '../index.js';
 
 const webhook = new Hono<Env>();
@@ -164,7 +166,7 @@ webhook.post('/webhook', async (c) => {
   const processingPromise = (async () => {
     for (const event of body.events) {
       try {
-        await handleEvent(db, lineClient, event, channelAccessToken, matchedAccountId, c.env.WORKER_URL || new URL(c.req.url).origin, c.env.LIFF_URL, c.env.IMAGES);
+        await handleEvent(db, lineClient, event, channelAccessToken, matchedAccountId, c.env.WORKER_URL || new URL(c.req.url).origin, c.env.LIFF_URL, c.env.IMAGES, c.env.GEMINI_API_KEY);
       } catch (err) {
         console.error('Error handling webhook event:', err);
       }
@@ -185,6 +187,7 @@ async function handleEvent(
   workerUrl?: string,
   liffUrl?: string,
   r2?: R2Bucket,
+  geminiApiKey?: string,
 ): Promise<void> {
   if (event.type === 'follow') {
     const userId =
@@ -665,6 +668,39 @@ async function handleEvent(
     // auto_replies にマッチしなかった = 自発メッセージ → unread にする
     if (!matched) {
       await upsertChatOnMessage(db, friend.id);
+
+      // 相談窓口 AI 一次応答 (Gemini)。GEMINI_API_KEY 未設定 / レート超過 / LLM失敗時は
+      // 何もせず従来どおり応答なし (fireEvent 側の通知のみ) にフォールバックする。
+      // replyToken を消費した場合のみ replyTokenConsumed=true にし、下の fireEvent には
+      // 渡さない（二重消費防止）。
+      if (geminiApiKey) {
+        try {
+          const rateLimited = await isConsultationRateLimited(db, friend.id);
+          if (!rateLimited) {
+            const prompt = buildConsultationPrompt(incomingText);
+            const aiText = await invokeLLM({ apiKey: geminiApiKey, prompt });
+            const aiReplyMsg = buildMessage('text', aiText);
+            await lineClient.replyMessage(event.replyToken, [aiReplyMsg]);
+            replyTokenConsumed = true;
+
+            // 送信ログ（他の reply 経路と同じ messages_log 記録パターン）
+            const aiLogId = crypto.randomUUID();
+            const { messageToLogPayload: logPayload3 } = await import('../services/step-delivery.js');
+            const aiReplyPayload = logPayload3(aiReplyMsg);
+            await db
+              .prepare(
+                `INSERT INTO messages_log (id, friend_id, direction, message_type, content, broadcast_id, scenario_step_id, delivery_type, source, created_at)
+                 VALUES (?, ?, 'outgoing', ?, ?, NULL, NULL, 'reply', 'ai_consultation', ?)`,
+              )
+              .bind(aiLogId, friend.id, aiReplyPayload.messageType, aiReplyPayload.content, jstNow())
+              .run();
+          }
+        } catch (err) {
+          // LLM失敗/タイムアウト時は reply しない。replyTokenConsumed は false のまま
+          // なので、下の fireEvent に replyToken がそのまま渡り従来動作を維持する。
+          console.error('[webhook] AI consultation reply failed, falling back', err);
+        }
+      }
     }
 
     // イベントバス発火: message_received

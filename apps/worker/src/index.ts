@@ -97,6 +97,10 @@ export type Env = {
     X_HARNESS_URL?: string;  // Optional: X Harness API URL for account linking
     IG_HARNESS_URL?: string;  // Optional: IG Harness API URL for cross-platform linking
     IG_HARNESS_LINK_SECRET?: string;  // Shared secret for IG Harness link-line webhook
+    // 相談窓口 AI 一次応答 (webhook.ts の auto_replies 未マッチフォールバック)。
+    // 未設定なら機能自体が無効化され、従来どおり応答なし (upsertChatOnMessage のみ) になる。
+    // Secret は `wrangler secret put GEMINI_API_KEY` で投入する想定。
+    GEMINI_API_KEY?: string;
     // Phase 5 self-update — consumed by /admin/update/*. Defaults live in
     // wrangler.toml [vars]; secrets (CF_API_TOKEN, ADMIN_API_KEY) come from
     // `wrangler secret put`. All are optional at the type level so the rest
