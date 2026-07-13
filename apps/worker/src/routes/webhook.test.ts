@@ -44,6 +44,12 @@ vi.mock('../services/event-bus.js', () => ({
 vi.mock('../services/step-delivery.js', () => ({
   buildMessage: vi.fn(),
   expandVariables: vi.fn(),
+  messageToLogPayload: vi.fn(),
+}));
+
+vi.mock('../services/llm.js', () => ({
+  invokeLLM: vi.fn(),
+  isConsultationRateLimited: vi.fn(),
 }));
 
 import { verifySignature } from '@line-crm/line-sdk';
@@ -66,6 +72,9 @@ import {
   upsertFriend,
 } from '@line-crm/db';
 import { fireEvent } from '../services/event-bus.js';
+import { buildMessage, messageToLogPayload } from '../services/step-delivery.js';
+import { invokeLLM, isConsultationRateLimited } from '../services/llm.js';
+import { buildConsultationPrompt } from '../services/consultationPrompt.js';
 import { webhook } from './webhook.js';
 
 function setupApp() {
@@ -295,5 +304,173 @@ describe('POST /webhook — first-contact existing friends', () => {
     expect(addTagToFriend).not.toHaveBeenCalled();
     expect(getEntryRouteByRefCode).not.toHaveBeenCalled();
     expect(getMessageTemplateById).not.toHaveBeenCalled();
+  });
+});
+
+describe('POST /webhook — AI consultation fallback (Gemini)', () => {
+  const aiTestFriend = {
+    id: 'friend-ai-1',
+    line_user_id: 'U-ai-1',
+    display_name: 'AI Test Friend',
+    picture_url: null,
+    status_message: null,
+    is_following: 1,
+    user_id: null,
+    line_account_id: null,
+    metadata: '{}',
+    first_tracked_link_id: null,
+    created_at: '2026-07-01T00:00:00.000+09:00',
+    updated_at: '2026-07-01T00:00:00.000+09:00',
+  };
+
+  function makeStmt() {
+    const stmt = {
+      bind: vi.fn(),
+      run: vi.fn().mockResolvedValue({}),
+      // Empty auto_replies match set → `matched` stays false so every test here
+      // exercises the fallback branch under test.
+      all: vi.fn().mockResolvedValue({ results: [] }),
+    };
+    stmt.bind.mockReturnValue(stmt);
+    return stmt;
+  }
+
+  function makeEvent(text: string, replyToken: string) {
+    return {
+      type: 'message',
+      replyToken,
+      message: { type: 'text', id: 'message-ai-1', text },
+      timestamp: Date.now(),
+      source: { type: 'user', userId: 'U-ai-1' },
+      webhookEventId: 'event-ai-1',
+      deliveryContext: { isRedelivery: false },
+      mode: 'active',
+    };
+  }
+
+  async function postConsultation(envOverrides: Record<string, unknown>, text = '営業時間を教えてください') {
+    const replyToken = 'reply-token-ai';
+    const stmt = makeStmt();
+    const db = { prepare: vi.fn().mockReturnValue(stmt) } as unknown as D1Database;
+    const executionCtx = {
+      waitUntil: vi.fn(),
+      passThroughOnException: vi.fn(),
+      props: {},
+    } as unknown as ExecutionContext;
+
+    const app = setupApp();
+    const validShapedSignature = 'A'.repeat(43) + '=';
+    const res = await app.request(
+      '/webhook',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Line-Signature': validShapedSignature,
+        },
+        body: JSON.stringify({ destination: 'bot', events: [makeEvent(text, replyToken)] }),
+      },
+      { ...baseEnv, DB: db, ...envOverrides },
+      executionCtx,
+    );
+
+    const processing = vi.mocked(executionCtx.waitUntil).mock.calls[0]?.[0] as Promise<unknown>;
+    await processing;
+
+    return { res, db, stmt, replyToken };
+  }
+
+  beforeEach(() => {
+    vi.mocked(verifySignature).mockResolvedValue(true);
+    vi.mocked(getFriendByLineUserId).mockResolvedValue(
+      aiTestFriend as unknown as Awaited<ReturnType<typeof getFriendByLineUserId>>,
+    );
+    vi.mocked(jstNow).mockReturnValue('2026-07-01T12:00:00.000+09:00');
+  });
+
+  test('(a) matched=false: invokes Gemini and replies with its text via replyMessage', async () => {
+    vi.mocked(isConsultationRateLimited).mockResolvedValue(false);
+    vi.mocked(invokeLLM).mockResolvedValue('担当者が確認のうえご連絡します。');
+    vi.mocked(buildMessage).mockReturnValue({ type: 'text', text: '担当者が確認のうえご連絡します。' });
+    vi.mocked(messageToLogPayload).mockReturnValue({ messageType: 'text', content: '担当者が確認のうえご連絡します。' });
+
+    const { res, replyToken } = await postConsultation({ GEMINI_API_KEY: 'test-gemini-key' }, '営業時間を教えてください');
+
+    expect(res.status).toBe(200);
+    expect(isConsultationRateLimited).toHaveBeenCalledWith(expect.anything(), 'friend-ai-1');
+    expect(invokeLLM).toHaveBeenCalledWith({
+      apiKey: 'test-gemini-key',
+      prompt: buildConsultationPrompt('営業時間を教えてください'),
+    });
+    expect(lineClientMocks.replyMessage).toHaveBeenCalledWith(replyToken, [
+      { type: 'text', text: '担当者が確認のうえご連絡します。' },
+    ]);
+  });
+
+  test('(b) LLM success: replyTokenConsumed=true so fireEvent does not receive the replyToken', async () => {
+    vi.mocked(isConsultationRateLimited).mockResolvedValue(false);
+    vi.mocked(invokeLLM).mockResolvedValue('AI reply text');
+    vi.mocked(buildMessage).mockReturnValue({ type: 'text', text: 'AI reply text' });
+    vi.mocked(messageToLogPayload).mockReturnValue({ messageType: 'text', content: 'AI reply text' });
+
+    await postConsultation({ GEMINI_API_KEY: 'test-gemini-key' });
+
+    expect(fireEvent).toHaveBeenCalledTimes(1);
+    const payload = vi.mocked(fireEvent).mock.calls[0][2] as { replyToken?: string };
+    expect(payload.replyToken).toBeUndefined();
+  });
+
+  test('(c) LLM error/timeout: does not reply, keeps replyTokenConsumed=false (original fallback)', async () => {
+    vi.mocked(isConsultationRateLimited).mockResolvedValue(false);
+    vi.mocked(invokeLLM).mockRejectedValue(new Error('Gemini API error: 500 Internal Server Error'));
+
+    const { res, replyToken } = await postConsultation({ GEMINI_API_KEY: 'test-gemini-key' });
+
+    expect(res.status).toBe(200);
+    expect(lineClientMocks.replyMessage).not.toHaveBeenCalled();
+    expect(upsertChatOnMessage).toHaveBeenCalledWith(expect.anything(), 'friend-ai-1');
+
+    const payload = vi.mocked(fireEvent).mock.calls[0][2] as { replyToken?: string };
+    expect(payload.replyToken).toBe(replyToken);
+  });
+
+  test('(d) rate limit exceeded (>3 in 60s): skips invokeLLM entirely', async () => {
+    vi.mocked(isConsultationRateLimited).mockResolvedValue(true);
+
+    const { res, replyToken } = await postConsultation({ GEMINI_API_KEY: 'test-gemini-key' });
+
+    expect(res.status).toBe(200);
+    expect(isConsultationRateLimited).toHaveBeenCalledWith(expect.anything(), 'friend-ai-1');
+    expect(invokeLLM).not.toHaveBeenCalled();
+    expect(lineClientMocks.replyMessage).not.toHaveBeenCalled();
+
+    const payload = vi.mocked(fireEvent).mock.calls[0][2] as { replyToken?: string };
+    expect(payload.replyToken).toBe(replyToken);
+  });
+
+  test('(e) message longer than 500 chars: prompt sent to Gemini is truncated via buildConsultationPrompt', async () => {
+    vi.mocked(isConsultationRateLimited).mockResolvedValue(false);
+    vi.mocked(invokeLLM).mockResolvedValue('AI reply text');
+    vi.mocked(buildMessage).mockReturnValue({ type: 'text', text: 'AI reply text' });
+    vi.mocked(messageToLogPayload).mockReturnValue({ messageType: 'text', content: 'AI reply text' });
+
+    const longMessage = 'あ'.repeat(700);
+    await postConsultation({ GEMINI_API_KEY: 'test-gemini-key' }, longMessage);
+
+    const calledPrompt = vi.mocked(invokeLLM).mock.calls[0][0].prompt;
+    expect(calledPrompt).toBe(buildConsultationPrompt(longMessage));
+    expect(calledPrompt).not.toContain('あ'.repeat(501));
+  });
+
+  test('does not check the rate limit or call Gemini at all when GEMINI_API_KEY is unset', async () => {
+    const { res, replyToken } = await postConsultation({});
+
+    expect(res.status).toBe(200);
+    expect(isConsultationRateLimited).not.toHaveBeenCalled();
+    expect(invokeLLM).not.toHaveBeenCalled();
+    expect(lineClientMocks.replyMessage).not.toHaveBeenCalled();
+
+    const payload = vi.mocked(fireEvent).mock.calls[0][2] as { replyToken?: string };
+    expect(payload.replyToken).toBe(replyToken);
   });
 });
