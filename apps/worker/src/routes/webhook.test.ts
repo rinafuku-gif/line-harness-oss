@@ -448,6 +448,20 @@ describe('POST /webhook — AI consultation fallback (Gemini)', () => {
     expect(payload.replyToken).toBe(replyToken);
   });
 
+  test('(e) message longer than 500 chars: prompt sent to Gemini is truncated via buildConsultationPrompt', async () => {
+    vi.mocked(isConsultationRateLimited).mockResolvedValue(false);
+    vi.mocked(invokeLLM).mockResolvedValue('AI reply text');
+    vi.mocked(buildMessage).mockReturnValue({ type: 'text', text: 'AI reply text' });
+    vi.mocked(messageToLogPayload).mockReturnValue({ messageType: 'text', content: 'AI reply text' });
+
+    const longMessage = 'あ'.repeat(700);
+    await postConsultation({ GEMINI_API_KEY: 'test-gemini-key' }, longMessage);
+
+    const calledPrompt = vi.mocked(invokeLLM).mock.calls[0][0].prompt;
+    expect(calledPrompt).toBe(buildConsultationPrompt(longMessage));
+    expect(calledPrompt).not.toContain('あ'.repeat(501));
+  });
+
   test('does not check the rate limit or call Gemini at all when GEMINI_API_KEY is unset', async () => {
     const { res, replyToken } = await postConsultation({});
 
