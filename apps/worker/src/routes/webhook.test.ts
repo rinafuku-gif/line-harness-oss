@@ -5,6 +5,7 @@ const lineClientMocks = vi.hoisted(() => ({
   getProfile: vi.fn(),
   replyMessage: vi.fn(),
   pushMessage: vi.fn(),
+  startLoadingAnimation: vi.fn().mockResolvedValue(undefined),
 }));
 
 // Stub the DB graph — these tests focus on webhook guard behavior and the
@@ -402,6 +403,32 @@ describe('POST /webhook — AI consultation fallback (Gemini)', () => {
       apiKey: 'test-gemini-key',
       prompt: buildConsultationPrompt('営業時間を教えてください'),
     });
+    expect(lineClientMocks.replyMessage).toHaveBeenCalledWith(replyToken, [
+      { type: 'text', text: '担当者が確認のうえご連絡します。' },
+    ]);
+  });
+
+  test('(a-2) fires the loading animation for the sender before replying (体感速度対策)', async () => {
+    vi.mocked(isConsultationRateLimited).mockResolvedValue(false);
+    vi.mocked(invokeLLM).mockResolvedValue('担当者が確認のうえご連絡します。');
+    vi.mocked(buildMessage).mockReturnValue({ type: 'text', text: '担当者が確認のうえご連絡します。' });
+    vi.mocked(messageToLogPayload).mockReturnValue({ messageType: 'text', content: '担当者が確認のうえご連絡します。' });
+
+    await postConsultation({ GEMINI_API_KEY: 'test-gemini-key' }, '営業時間を教えてください');
+
+    expect(lineClientMocks.startLoadingAnimation).toHaveBeenCalledWith('U-ai-1', 30);
+  });
+
+  test('(a-3) loading animation failure does not block the AI reply (fire-and-forget)', async () => {
+    lineClientMocks.startLoadingAnimation.mockRejectedValueOnce(new Error('LINE API error: 400 not viewing chat'));
+    vi.mocked(isConsultationRateLimited).mockResolvedValue(false);
+    vi.mocked(invokeLLM).mockResolvedValue('担当者が確認のうえご連絡します。');
+    vi.mocked(buildMessage).mockReturnValue({ type: 'text', text: '担当者が確認のうえご連絡します。' });
+    vi.mocked(messageToLogPayload).mockReturnValue({ messageType: 'text', content: '担当者が確認のうえご連絡します。' });
+
+    const { res, replyToken } = await postConsultation({ GEMINI_API_KEY: 'test-gemini-key' }, '営業時間を教えてください');
+
+    expect(res.status).toBe(200);
     expect(lineClientMocks.replyMessage).toHaveBeenCalledWith(replyToken, [
       { type: 'text', text: '担当者が確認のうえご連絡します。' },
     ]);
