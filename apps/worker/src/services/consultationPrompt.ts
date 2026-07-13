@@ -19,6 +19,13 @@
  */
 export const MAX_USER_MESSAGE_LENGTH = 500;
 
+/**
+ * Gemini 生成が失敗/タイムアウト/MAX_TOKENS切れした場合に送る定型フォールバック文。
+ * 中途半端な生成テキストをユーザーに送らないための代替（webhook.ts から使用）。
+ */
+export const CONSULTATION_FALLBACK_MESSAGE =
+  '只今アクセスが混み合っており、すぐにお答えできませんでした。恐れ入りますが、もう一度同じ内容を送っていただけますでしょうか。';
+
 export function buildConsultationPrompt(userMessage: string): string {
   const truncatedMessage = userMessage.slice(0, MAX_USER_MESSAGE_LENGTH);
 
@@ -28,7 +35,7 @@ export function buildConsultationPrompt(userMessage: string): string {
     '## 制約',
     '- 料金・在庫・可否・日程など、事実確認が必要な内容は断定せず「担当者が確認のうえ改めてご連絡します」という趣旨で伝える',
     '- 知らないことを推測で答えない',
-    '- 敬語・丁寧語を使い、LINEのトーク画面で読みやすい2〜4文程度の短い返信にする',
+    '- 敬語・丁寧語を使い、LINEのトーク画面で読みやすい2〜4文・300字以内の短い返信にする',
     '- 絵文字・記号の多用はしない',
     '- 挨拶や前置きから始めず、要件への反応から始める',
     '',

@@ -18,6 +18,15 @@ const GEMINI_TIMEOUT_MS = 12_000;
 
 const GEMINI_MAX_OUTPUT_TOKENS = 512;
 
+// gemini-flash-latest (Gemini 2.5/3 Flash 系) は既定で「thinking」が有効で、
+// thinking トークンも maxOutputTokens の予算から消費される。プロンプト側で
+// 短文回答を指示していても、thinking が予算の大半を食うと可視テキストが
+// 文の途中で切れたまま finishReason=MAX_TOKENS で返ってくる
+// (thoughtsTokenCount が大半を占め candidatesTokenCount がわずかになる既知の挙動)。
+// 一次応答窓口は低レイテンシ・簡潔な定型文で足りるため thinking は不要 → budget=0 で無効化する。
+// 参考: https://ai.google.dev/gemini-api/docs/thinking#set-budget
+const GEMINI_THINKING_BUDGET = 0;
+
 export interface InvokeLLMOptions {
   apiKey: string;
   prompt: string;
@@ -29,13 +38,15 @@ interface GeminiGenerateContentResponse {
     content?: {
       parts?: Array<{ text?: string }>;
     };
+    finishReason?: string;
   }>;
 }
 
 /**
  * Gemini にプロンプトを送り、テキスト応答を1つ返す。
- * 失敗時 (HTTP エラー / タイムアウト / 予期しないレスポンス形状) は例外を投げる。
- * 呼び出し元で catch してフォールバックすること。
+ * 失敗時 (HTTP エラー / タイムアウト / 予期しないレスポンス形状 / MAX_TOKENS による
+ * 途中切れ) は例外を投げる。呼び出し元で catch して定型フォールバック文を送ること
+ * （中途半端な文をユーザーに送らないため、切れた候補テキストはここで握りつぶす）。
  */
 export async function invokeLLM({ apiKey, prompt, timeoutMs = GEMINI_TIMEOUT_MS }: InvokeLLMOptions): Promise<string> {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`;
@@ -45,7 +56,10 @@ export async function invokeLLM({ apiKey, prompt, timeoutMs = GEMINI_TIMEOUT_MS 
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: { maxOutputTokens: GEMINI_MAX_OUTPUT_TOKENS },
+      generationConfig: {
+        maxOutputTokens: GEMINI_MAX_OUTPUT_TOKENS,
+        thinkingConfig: { thinkingBudget: GEMINI_THINKING_BUDGET },
+      },
     }),
     signal: AbortSignal.timeout(timeoutMs),
   });
@@ -55,10 +69,17 @@ export async function invokeLLM({ apiKey, prompt, timeoutMs = GEMINI_TIMEOUT_MS 
   }
 
   const json = (await response.json()) as GeminiGenerateContentResponse;
-  const text = json.candidates?.[0]?.content?.parts?.[0]?.text;
+  const candidate = json.candidates?.[0];
+  const text = candidate?.content?.parts?.[0]?.text;
 
   if (!text || !text.trim()) {
     throw new Error('Gemini API returned no text');
+  }
+
+  // thinkingBudget=0 にしても API 側の挙動変更や長い応答で MAX_TOKENS に達する
+  // ケースへの安全網。文の途中で切れた候補をそのままユーザーに送らない。
+  if (candidate?.finishReason === 'MAX_TOKENS') {
+    throw new Error('Gemini API response truncated (finishReason=MAX_TOKENS)');
   }
 
   return text.trim();

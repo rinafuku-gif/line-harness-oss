@@ -64,6 +64,39 @@ describe('invokeLLM', () => {
 
     await expect(invokeLLM({ apiKey: 'test-key', prompt: 'test prompt' })).rejects.toThrow();
   });
+
+  test('sends thinkingConfig.thinkingBudget=0 to avoid thinking tokens eating maxOutputTokens', async () => {
+    vi.mocked(fetch).mockResolvedValue(
+      mockFetchResponse({
+        json: async () => ({
+          candidates: [{ content: { parts: [{ text: '担当者が確認のうえご連絡します。' } ] }, finishReason: 'STOP' }],
+        }),
+      }),
+    );
+
+    await invokeLLM({ apiKey: 'test-key', prompt: 'test prompt' });
+
+    const [, init] = vi.mocked(fetch).mock.calls[0];
+    const body = JSON.parse(init?.body as string);
+    expect(body.generationConfig.thinkingConfig).toEqual({ thinkingBudget: 0 });
+  });
+
+  test('throws (does not return partial text) when finishReason is MAX_TOKENS', async () => {
+    vi.mocked(fetch).mockResolvedValue(
+      mockFetchResponse({
+        json: async () => ({
+          candidates: [
+            {
+              content: { parts: [{ text: '大月での古民家民泊における補助金のご利用についてですね。／補助金の' }] },
+              finishReason: 'MAX_TOKENS',
+            },
+          ],
+        }),
+      }),
+    );
+
+    await expect(invokeLLM({ apiKey: 'test-key', prompt: 'test prompt' })).rejects.toThrow('MAX_TOKENS');
+  });
 });
 
 describe('isConsultationRateLimited', () => {
