@@ -41,6 +41,9 @@ describe('invokeLLM', () => {
     const [url, init] = vi.mocked(fetch).mock.calls[0];
     expect(String(url)).toContain('generativelanguage.googleapis.com');
     expect(String(url)).toContain('key=test-key');
+    // レイテンシ短縮のため軽量ティア (flash-lite 系) を使うこと。誤って
+    // 重量級モデルに戻す変更が入った場合にテストで気づけるようにする。
+    expect(String(url)).toContain('flash-lite');
     expect(init?.method).toBe('POST');
 
     const body = JSON.parse(init?.body as string);

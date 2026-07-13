@@ -8,7 +8,14 @@ import { toJstString } from '@line-crm/db';
  * 呼び出し元 (webhook.ts) は失敗/タイムアウトを catch し、従来のフォールバック
  * (upsertChatOnMessage のみ・返信なし) に倒すこと。
  */
-const GEMINI_MODEL = 'gemini-flash-latest';
+// gemini-flash-latest は Google 側の "-latest" エイリアスで、裏側のモデル世代が
+// 無告知で切り替わりうる(現状 Gemini 3.5 Flash 系に解決される想定)。相談窓口の
+// 一次応答は「短文・低レイテンシで足りる」用途のため、同世代の軽量ティア
+// gemini-3.1-flash-lite (Google公式ドキュメントに記載のある安定モデルID。
+// https://ai.google.dev/gemini-api/docs/models 参照) に切り替えて生成時間短縮を狙う。
+// 【未検証】実際の生成時間短縮幅・日本語トーン品質は本番デプロイ後に実メッセージで
+// 確認すること（このタスクではデプロイ用CFトークンが無く実測できていない）。
+const GEMINI_MODEL = 'gemini-3.1-flash-lite';
 
 // LINE の replyToken は発行から約1分で失効する。ただし webhook 本体は
 // waitUntil 内の非同期処理として実行されるため、LINE への 200 応答自体は

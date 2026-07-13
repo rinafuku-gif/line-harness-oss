@@ -35,6 +35,13 @@ const webhook = new Hono<Env>();
 // 128 MB Cloudflare Workers memory ceiling.
 const MAX_WEBHOOK_BODY_SIZE = 1024 * 1024; // 1 MiB
 
+// テキストメッセージ受信直後に出す LINE ローディングアニメーションの表示秒数。
+// 相談窓口 AI 一次応答 (Gemini) の生成待ち体感を改善する目的 (体感速度対策)。
+// 実際の表示は「生成完了 (= 返信メッセージ到着)」または本値の経過のどちらか早い方で
+// 消えるため (LINE 仕様)、長めに倒しても生成が速く終われば長く表示され続けることはない。
+// 現状の実測 (30秒程度) をカバーしつつ LINE 仕様の上限 (60秒) に収める値として 30 とする。
+const LOADING_ANIMATION_SECONDS = 30;
+
 async function ensureFriendFromWebhookUser(
   db: D1Database,
   lineClient: LineClient,
@@ -528,6 +535,17 @@ async function handleEvent(
       event.source.type === 'user' ? event.source.userId : undefined;
     if (!userId) return;
 
+    // 受信直後・Gemini呼び出し前にローディングアニメーションを出す（体感速度対策）。
+    // fire-and-forget: メイン処理の待ち時間には入れない。1:1トーク限定の LINE 仕様
+    // なので失敗しても本処理には影響させず、ログのみ残す。
+    try {
+      void lineClient.startLoadingAnimation(userId, LOADING_ANIMATION_SECONDS).catch((err) => {
+        console.error('[webhook] loading animation failed', err);
+      });
+    } catch (err) {
+      console.error('[webhook] loading animation failed (sync)', err);
+    }
+
     const friend = await ensureFriendFromWebhookUser(db, lineClient, userId, lineAccountId);
     if (!friend) return;
 
@@ -677,22 +695,37 @@ async function handleEvent(
       // replyToken を消費した場合のみ replyTokenConsumed=true にし、下の fireEvent には
       // 渡さない（二重消費防止）。
       if (geminiApiKey) {
+        // レイテンシ計測（30秒問題の内訳特定用・恒久計装）。D1レート制限クエリ /
+        // Gemini生成 / LINE reply の各区間でどこが支配的かを wrangler tail で
+        // 追えるようにする。本番トラフィック量はレート制限 (60秒3件) で自然に
+        // 抑えられるため常時onでもログ量は問題にならない。
+        const consultationStart = Date.now();
         try {
           const rateLimited = await isConsultationRateLimited(db, friend.id);
+          console.log(`[webhook][perf] rateLimit check: ${Date.now() - consultationStart}ms`);
           if (!rateLimited) {
             let aiText: string;
             let logSource: 'ai_consultation' | 'ai_consultation_fallback' = 'ai_consultation';
+            const geminiStart = Date.now();
             try {
               const prompt = buildConsultationPrompt(incomingText);
               aiText = await invokeLLM({ apiKey: geminiApiKey, prompt });
+              console.log(`[webhook][perf] gemini invokeLLM: ${Date.now() - geminiStart}ms`);
             } catch (llmErr) {
-              console.error('[webhook] AI consultation generation failed, sending fallback text', llmErr);
+              console.error(
+                `[webhook] AI consultation generation failed after ${Date.now() - geminiStart}ms, sending fallback text`,
+                llmErr,
+              );
               aiText = CONSULTATION_FALLBACK_MESSAGE;
               logSource = 'ai_consultation_fallback';
             }
 
             const aiReplyMsg = buildMessage('text', aiText);
+            const lineReplyStart = Date.now();
             await lineClient.replyMessage(event.replyToken, [aiReplyMsg]);
+            console.log(
+              `[webhook][perf] line replyMessage: ${Date.now() - lineReplyStart}ms / total ai-consultation path: ${Date.now() - consultationStart}ms`,
+            );
             replyTokenConsumed = true;
 
             // 送信ログ（他の reply 経路と同じ messages_log 記録パターン）
