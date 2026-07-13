@@ -74,7 +74,7 @@ import {
 import { fireEvent } from '../services/event-bus.js';
 import { buildMessage, messageToLogPayload } from '../services/step-delivery.js';
 import { invokeLLM, isConsultationRateLimited } from '../services/llm.js';
-import { buildConsultationPrompt } from '../services/consultationPrompt.js';
+import { buildConsultationPrompt, CONSULTATION_FALLBACK_MESSAGE } from '../services/consultationPrompt.js';
 import { webhook } from './webhook.js';
 
 function setupApp() {
@@ -420,14 +420,35 @@ describe('POST /webhook — AI consultation fallback (Gemini)', () => {
     expect(payload.replyToken).toBeUndefined();
   });
 
-  test('(c) LLM error/timeout: does not reply, keeps replyTokenConsumed=false (original fallback)', async () => {
+  test('(c) LLM error/timeout/MAX_TOKENS: sends the fixed fallback text instead of staying silent, consumes replyToken', async () => {
     vi.mocked(isConsultationRateLimited).mockResolvedValue(false);
     vi.mocked(invokeLLM).mockRejectedValue(new Error('Gemini API error: 500 Internal Server Error'));
+    vi.mocked(buildMessage).mockReturnValue({ type: 'text', text: CONSULTATION_FALLBACK_MESSAGE });
+    vi.mocked(messageToLogPayload).mockReturnValue({ messageType: 'text', content: CONSULTATION_FALLBACK_MESSAGE });
 
     const { res, replyToken } = await postConsultation({ GEMINI_API_KEY: 'test-gemini-key' });
 
     expect(res.status).toBe(200);
-    expect(lineClientMocks.replyMessage).not.toHaveBeenCalled();
+    // 中途半端な生成文は送らないが、無応答のまま放置もしない — 定型フォールバック文を送る
+    expect(lineClientMocks.replyMessage).toHaveBeenCalledWith(replyToken, [
+      { type: 'text', text: CONSULTATION_FALLBACK_MESSAGE },
+    ]);
+    expect(upsertChatOnMessage).toHaveBeenCalledWith(expect.anything(), 'friend-ai-1');
+
+    // replyToken を消費したので fireEvent には渡らない（二重消費防止）
+    const payload = vi.mocked(fireEvent).mock.calls[0][2] as { replyToken?: string };
+    expect(payload.replyToken).toBeUndefined();
+  });
+
+  test('(c-2) LLM error AND the fallback replyMessage itself also fails: stays silent, keeps replyTokenConsumed=false (original safety net)', async () => {
+    vi.mocked(isConsultationRateLimited).mockResolvedValue(false);
+    vi.mocked(invokeLLM).mockRejectedValue(new Error('Gemini API error: 500 Internal Server Error'));
+    vi.mocked(buildMessage).mockReturnValue({ type: 'text', text: CONSULTATION_FALLBACK_MESSAGE });
+    lineClientMocks.replyMessage.mockRejectedValueOnce(new Error('LINE API error: 500'));
+
+    const { res, replyToken } = await postConsultation({ GEMINI_API_KEY: 'test-gemini-key' });
+
+    expect(res.status).toBe(200);
     expect(upsertChatOnMessage).toHaveBeenCalledWith(expect.anything(), 'friend-ai-1');
 
     const payload = vi.mocked(fireEvent).mock.calls[0][2] as { replyToken?: string };

@@ -24,7 +24,7 @@ import type { EntryRoute, Friend } from '@line-crm/db';
 import { fireEvent } from '../services/event-bus.js';
 import { buildMessage, expandVariables } from '../services/step-delivery.js';
 import { invokeLLM, isConsultationRateLimited } from '../services/llm.js';
-import { buildConsultationPrompt } from '../services/consultationPrompt.js';
+import { buildConsultationPrompt, CONSULTATION_FALLBACK_MESSAGE } from '../services/consultationPrompt.js';
 import type { Env } from '../index.js';
 
 const webhook = new Hono<Env>();
@@ -669,16 +669,28 @@ async function handleEvent(
     if (!matched) {
       await upsertChatOnMessage(db, friend.id);
 
-      // 相談窓口 AI 一次応答 (Gemini)。GEMINI_API_KEY 未設定 / レート超過 / LLM失敗時は
-      // 何もせず従来どおり応答なし (fireEvent 側の通知のみ) にフォールバックする。
+      // 相談窓口 AI 一次応答 (Gemini)。GEMINI_API_KEY 未設定 / レート超過時は何もせず
+      // 従来どおり応答なし (fireEvent 側の通知のみ) にフォールバックする。
+      // LLM生成そのものが失敗/タイムアウト/MAX_TOKENS切れした場合は、中途半端な文を
+      // 送らずに定型フォールバック文 (CONSULTATION_FALLBACK_MESSAGE) を送る
+      // （無応答よりユーザー体験が良く、replyToken を確実に消費できる）。
       // replyToken を消費した場合のみ replyTokenConsumed=true にし、下の fireEvent には
       // 渡さない（二重消費防止）。
       if (geminiApiKey) {
         try {
           const rateLimited = await isConsultationRateLimited(db, friend.id);
           if (!rateLimited) {
-            const prompt = buildConsultationPrompt(incomingText);
-            const aiText = await invokeLLM({ apiKey: geminiApiKey, prompt });
+            let aiText: string;
+            let logSource: 'ai_consultation' | 'ai_consultation_fallback' = 'ai_consultation';
+            try {
+              const prompt = buildConsultationPrompt(incomingText);
+              aiText = await invokeLLM({ apiKey: geminiApiKey, prompt });
+            } catch (llmErr) {
+              console.error('[webhook] AI consultation generation failed, sending fallback text', llmErr);
+              aiText = CONSULTATION_FALLBACK_MESSAGE;
+              logSource = 'ai_consultation_fallback';
+            }
+
             const aiReplyMsg = buildMessage('text', aiText);
             await lineClient.replyMessage(event.replyToken, [aiReplyMsg]);
             replyTokenConsumed = true;
@@ -690,14 +702,15 @@ async function handleEvent(
             await db
               .prepare(
                 `INSERT INTO messages_log (id, friend_id, direction, message_type, content, broadcast_id, scenario_step_id, delivery_type, source, created_at)
-                 VALUES (?, ?, 'outgoing', ?, ?, NULL, NULL, 'reply', 'ai_consultation', ?)`,
+                 VALUES (?, ?, 'outgoing', ?, ?, NULL, NULL, 'reply', ?, ?)`,
               )
-              .bind(aiLogId, friend.id, aiReplyPayload.messageType, aiReplyPayload.content, jstNow())
+              .bind(aiLogId, friend.id, aiReplyPayload.messageType, aiReplyPayload.content, logSource, jstNow())
               .run();
           }
         } catch (err) {
-          // LLM失敗/タイムアウト時は reply しない。replyTokenConsumed は false のまま
-          // なので、下の fireEvent に replyToken がそのまま渡り従来動作を維持する。
+          // replyMessage 自体の失敗 (LINE API エラー等) 時は reply 未消費のまま。
+          // replyTokenConsumed は false のままなので、下の fireEvent に replyToken が
+          // そのまま渡り従来動作を維持する。
           console.error('[webhook] AI consultation reply failed, falling back', err);
         }
       }
