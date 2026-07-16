@@ -1242,18 +1242,85 @@ describe('POST /webhook — owner command ("管理画面")', () => {
     );
   });
 
-  test('owner sending the exact keyword gets the admin URL via replyMessage, and does not reach fireEvent/AI', async () => {
+  test('owner sending the exact keyword without CHAT_BACKEND_URL/SECRET configured falls back to the static admin URL + external-browser notice, and does not reach fireEvent/AI', async () => {
+    // "管理画面" は動的コマンド（services/adminMagicLink.ts が SATOYAMA 側の magic link
+    // 発行APIを叩く）。CHAT_BACKEND_URL/SECRET 未設定時は発行APIを呼ばずフォールバック文言
+    // を返す（requestAdminMagicLinkUrl の早期return・fetchは呼ばれない）。
     const { res, replyToken } = await postOwnerMessage('U-owner-1', '管理画面', {
       OWNER_LINE_USER_IDS: 'U-owner-1',
     });
 
     expect(res.status).toBe(200);
     expect(lineClientMocks.replyMessage).toHaveBeenCalledWith(replyToken, [
-      { type: 'text', text: 'https://satoyama-ai-base.vercel.app/admin' },
+      {
+        type: 'text',
+        text: 'https://satoyama-ai-base.vercel.app/admin\n\n※LINE内で開けない場合は、外部ブラウザ（Safari/Chrome等）で開いてログインしてください。',
+      },
     ]);
     // Short-circuits before the normal message pipeline (no unread/AI-consultation side effects).
     expect(fireEvent).not.toHaveBeenCalled();
     expect(invokeLLM).not.toHaveBeenCalled();
+  });
+
+  test('owner sending the exact keyword with CHAT_BACKEND_URL/SECRET configured returns the one-time magic link URL from the backend', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        json: async () => ({ url: 'https://satoyama-ai-base.vercel.app/admin-login?token=one-time-token' }),
+      } as unknown as Response),
+    );
+
+    try {
+      const { res, replyToken, stmt } = await postOwnerMessage('U-owner-1', '管理画面', {
+        OWNER_LINE_USER_IDS: 'U-owner-1',
+        CHAT_BACKEND_URL: 'https://satoyama-ai-base.vercel.app',
+        CHAT_BACKEND_SECRET: 'shared-secret',
+      });
+
+      expect(res.status).toBe(200);
+      expect(lineClientMocks.replyMessage).toHaveBeenCalledWith(replyToken, [
+        { type: 'text', text: 'https://satoyama-ai-base.vercel.app/admin-login?token=one-time-token' },
+      ]);
+      expect(fetch).toHaveBeenCalledTimes(1);
+      const [url, init] = vi.mocked(fetch).mock.calls[0];
+      expect(String(url)).toBe('https://satoyama-ai-base.vercel.app/api/admin/magic-link');
+      expect((init?.headers as Record<string, string>).Authorization).toBe('Bearer shared-secret');
+      expect(fireEvent).not.toHaveBeenCalled();
+
+      // messages_log（会話履歴の監査ログ）にはトークン入りURLをそのまま残さない
+      // （services/adminMagicLink.ts redactAdminMagicLinkForLog）。
+      const lastBindArgs = stmt.bind.mock.calls[stmt.bind.mock.calls.length - 1];
+      const loggedContent = lastBindArgs?.[2];
+      expect(loggedContent).toBe('https://satoyama-ai-base.vercel.app/admin-login?token=[REDACTED]');
+      expect(loggedContent).not.toContain('one-time-token');
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  test('owner sending the exact keyword with backend configured but failing falls back to the static URL notice', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('network error')));
+
+    try {
+      const { res, replyToken } = await postOwnerMessage('U-owner-1', '管理画面', {
+        OWNER_LINE_USER_IDS: 'U-owner-1',
+        CHAT_BACKEND_URL: 'https://satoyama-ai-base.vercel.app',
+        CHAT_BACKEND_SECRET: 'shared-secret',
+      });
+
+      expect(res.status).toBe(200);
+      expect(lineClientMocks.replyMessage).toHaveBeenCalledWith(replyToken, [
+        {
+          type: 'text',
+          text: 'https://satoyama-ai-base.vercel.app/admin\n\n※LINE内で開けない場合は、外部ブラウザ（Safari/Chrome等）で開いてログインしてください。',
+        },
+      ]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   test('owner sending a non-command message falls through to normal handling (no reply from owner-command layer)', async () => {

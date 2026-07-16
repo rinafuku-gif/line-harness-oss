@@ -1,5 +1,6 @@
-import { describe, expect, test } from 'vitest';
-import { isOwnerLineUserId, matchOwnerCommand, parseOwnerLineUserIds } from './owner-commands.js';
+import { describe, expect, test, vi, beforeEach, afterEach } from 'vitest';
+import { isOwnerLineUserId, matchOwnerCommand, parseOwnerLineUserIds, resolveOwnerCommandReply } from './owner-commands.js';
+import { ADMIN_DASHBOARD_FALLBACK_MESSAGE, ADMIN_DASHBOARD_STATIC_URL } from './adminMagicLink.js';
 
 describe('parseOwnerLineUserIds', () => {
   test('splits a comma-separated list and trims whitespace', () => {
@@ -53,5 +54,65 @@ describe('matchOwnerCommand', () => {
 
   test('returns null for empty string', () => {
     expect(matchOwnerCommand('')).toBeNull();
+  });
+});
+
+function mockFetchResponse(overrides: { ok?: boolean; json?: () => Promise<unknown> }) {
+  return {
+    ok: overrides.ok ?? true,
+    status: overrides.ok === false ? 500 : 200,
+    statusText: 'OK',
+    json: overrides.json ?? (async () => ({})),
+  } as unknown as Response;
+}
+
+describe('resolveOwnerCommandReply', () => {
+  beforeEach(() => {
+    vi.stubGlobal('fetch', vi.fn());
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  test('「管理画面」は発行APIを叩き、成功時はワンタイムURLを返す（固定URLではない）', async () => {
+    vi.mocked(fetch).mockResolvedValue(
+      mockFetchResponse({ json: async () => ({ url: 'https://example.vercel.app/admin-login?token=xyz' }) }),
+    );
+
+    const reply = await resolveOwnerCommandReply('管理画面', {
+      backendUrl: 'https://example.vercel.app',
+      backendSecret: 'shared-secret',
+    });
+
+    expect(reply).toBe('https://example.vercel.app/admin-login?token=xyz');
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  test('「管理画面」で発行APIが失敗したら固定URL＋外部ブラウザ案内にフォールバックする', async () => {
+    vi.mocked(fetch).mockRejectedValue(new Error('network error'));
+
+    const reply = await resolveOwnerCommandReply('管理画面', {
+      backendUrl: 'https://example.vercel.app',
+      backendSecret: 'shared-secret',
+    });
+
+    expect(reply).toBe(ADMIN_DASHBOARD_FALLBACK_MESSAGE);
+    expect(reply).toContain(ADMIN_DASHBOARD_STATIC_URL);
+  });
+
+  test('前後空白があっても「管理画面」として動的解決される', async () => {
+    vi.mocked(fetch).mockResolvedValue(
+      mockFetchResponse({ json: async () => ({ url: 'https://example.vercel.app/admin-login?token=xyz' }) }),
+    );
+
+    const reply = await resolveOwnerCommandReply('  管理画面  ', { backendUrl: 'https://example.vercel.app', backendSecret: 's' });
+    expect(reply).toBe('https://example.vercel.app/admin-login?token=xyz');
+  });
+
+  test('管理画面以外の未知の文言はnull（発行APIを叩かない）', async () => {
+    const reply = await resolveOwnerCommandReply('こんにちは', { backendUrl: 'https://example.vercel.app', backendSecret: 's' });
+    expect(reply).toBeNull();
+    expect(fetch).not.toHaveBeenCalled();
   });
 });

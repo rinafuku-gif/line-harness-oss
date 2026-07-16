@@ -25,7 +25,8 @@ import { fireEvent } from '../services/event-bus.js';
 import { buildMessage, expandVariables } from '../services/step-delivery.js';
 import { invokeLLM, isConsultationRateLimited } from '../services/llm.js';
 import { buildConsultationPrompt, CONSULTATION_FALLBACK_MESSAGE } from '../services/consultationPrompt.js';
-import { isOwnerLineUserId, matchOwnerCommand } from '../services/owner-commands.js';
+import { isOwnerLineUserId, resolveOwnerCommandReply } from '../services/owner-commands.js';
+import { redactAdminMagicLinkForLog } from '../services/adminMagicLink.js';
 import {
   isChatParityEnabled,
   invokeChatBackend,
@@ -819,19 +820,27 @@ async function handleEvent(
     // オーナーコマンド: OWNER_LINE_USER_IDS に登録された送信者だけが対象。
     // 非オーナーは isOwnerLineUserId() で弾かれ、以降の通常処理 (体験トリガー/自動返信/
     // AI一次応答) にそのままフォールスルーする — コマンドの存在自体を漏らさないため。
+    // 「管理画面」は動的コマンド（SATOYAMA側のワンタイム入場リンクを発行するAPIを叩く。
+    // 詳細: services/adminMagicLink.ts）。CHAT_BACKEND_URL/SECRET は外部チャット
+    // バックエンド連携と同じ wrangler secret を再利用する。
     if (isOwnerLineUserId(userId, ownerLineUserIds)) {
-      const ownerReply = matchOwnerCommand(incomingText);
+      const ownerReply = await resolveOwnerCommandReply(incomingText, {
+        backendUrl: chatBackendEnv.backendUrl,
+        backendSecret: chatBackendEnv.backendSecret,
+      });
       if (ownerReply) {
         try {
           const ownerMsg = buildMessage('text', ownerReply);
           await lineClient.replyMessage(event.replyToken, [ownerMsg]);
 
+          // messages_log にはトークン入りURLをそのまま残さない（会話ログを見ただけで
+          // 10分間ログインできてしまうのを防ぐ。詳細: services/adminMagicLink.ts）。
           await db
             .prepare(
               `INSERT INTO messages_log (id, friend_id, direction, message_type, content, broadcast_id, scenario_step_id, delivery_type, source, created_at)
                VALUES (?, ?, 'outgoing', 'text', ?, NULL, NULL, 'reply', 'owner_command', ?)`,
             )
-            .bind(crypto.randomUUID(), friend.id, ownerReply, jstNow())
+            .bind(crypto.randomUUID(), friend.id, redactAdminMagicLinkForLog(ownerReply), jstNow())
             .run();
         } catch (err) {
           console.error('[webhook] owner command reply failed', err);
