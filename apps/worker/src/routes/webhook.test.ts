@@ -522,3 +522,133 @@ describe('POST /webhook — AI consultation fallback (Gemini)', () => {
     expect(payload.replyToken).toBe(replyToken);
   });
 });
+
+describe('POST /webhook — owner command ("管理画面")', () => {
+  const ownerFriend = {
+    id: 'friend-owner-1',
+    line_user_id: 'U-owner-1',
+    display_name: 'ryosuke.ina',
+    picture_url: null,
+    status_message: null,
+    is_following: 1,
+    user_id: null,
+    line_account_id: null,
+    metadata: '{}',
+    first_tracked_link_id: null,
+    created_at: '2026-07-01T00:00:00.000+09:00',
+    updated_at: '2026-07-01T00:00:00.000+09:00',
+  };
+
+  function makeStmt() {
+    const stmt = {
+      bind: vi.fn(),
+      run: vi.fn().mockResolvedValue({}),
+      all: vi.fn().mockResolvedValue({ results: [] }),
+    };
+    stmt.bind.mockReturnValue(stmt);
+    return stmt;
+  }
+
+  function makeEvent(userId: string, text: string, replyToken = 'reply-token-owner') {
+    return {
+      type: 'message',
+      replyToken,
+      message: { type: 'text', id: 'message-owner-1', text },
+      timestamp: Date.now(),
+      source: { type: 'user', userId },
+      webhookEventId: 'event-owner-1',
+      deliveryContext: { isRedelivery: false },
+      mode: 'active',
+    };
+  }
+
+  async function postOwnerMessage(
+    userId: string,
+    text: string,
+    envOverrides: Record<string, unknown>,
+  ) {
+    const replyToken = 'reply-token-owner';
+    const stmt = makeStmt();
+    const db = { prepare: vi.fn().mockReturnValue(stmt) } as unknown as D1Database;
+    const executionCtx = {
+      waitUntil: vi.fn(),
+      passThroughOnException: vi.fn(),
+      props: {},
+    } as unknown as ExecutionContext;
+
+    const app = setupApp();
+    const validShapedSignature = 'A'.repeat(43) + '=';
+    const res = await app.request(
+      '/webhook',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Line-Signature': validShapedSignature,
+        },
+        body: JSON.stringify({ destination: 'bot', events: [makeEvent(userId, text, replyToken)] }),
+      },
+      { ...baseEnv, DB: db, ...envOverrides },
+      executionCtx,
+    );
+
+    const processing = vi.mocked(executionCtx.waitUntil).mock.calls[0]?.[0] as Promise<unknown>;
+    await processing;
+
+    return { res, db, stmt, replyToken };
+  }
+
+  beforeEach(() => {
+    vi.mocked(verifySignature).mockResolvedValue(true);
+    vi.mocked(getFriendByLineUserId).mockResolvedValue(
+      ownerFriend as unknown as Awaited<ReturnType<typeof getFriendByLineUserId>>,
+    );
+    vi.mocked(jstNow).mockReturnValue('2026-07-17T09:00:00.000+09:00');
+    vi.mocked(buildMessage).mockImplementation(
+      (messageType: string, content: string) => ({ type: messageType, text: content }) as never,
+    );
+  });
+
+  test('owner sending the exact keyword gets the admin URL via replyMessage, and does not reach fireEvent/AI', async () => {
+    const { res, replyToken } = await postOwnerMessage('U-owner-1', '管理画面', {
+      OWNER_LINE_USER_IDS: 'U-owner-1',
+    });
+
+    expect(res.status).toBe(200);
+    expect(lineClientMocks.replyMessage).toHaveBeenCalledWith(replyToken, [
+      { type: 'text', text: 'https://satoyama-ai-base.vercel.app/admin' },
+    ]);
+    // Short-circuits before the normal message pipeline (no unread/AI-consultation side effects).
+    expect(fireEvent).not.toHaveBeenCalled();
+    expect(invokeLLM).not.toHaveBeenCalled();
+  });
+
+  test('owner sending a non-command message falls through to normal handling (no reply from owner-command layer)', async () => {
+    const { res } = await postOwnerMessage('U-owner-1', 'こんにちは', {
+      OWNER_LINE_USER_IDS: 'U-owner-1',
+    });
+
+    expect(res.status).toBe(200);
+    expect(lineClientMocks.replyMessage).not.toHaveBeenCalled();
+    expect(fireEvent).toHaveBeenCalledTimes(1);
+  });
+
+  test('non-owner sending the exact keyword gets no special reply — command existence is not leaked', async () => {
+    const { res } = await postOwnerMessage('U-stranger', '管理画面', {
+      OWNER_LINE_USER_IDS: 'U-owner-1',
+    });
+
+    expect(res.status).toBe(200);
+    expect(lineClientMocks.replyMessage).not.toHaveBeenCalled();
+    // Falls through to the normal pipeline exactly like any other unmatched text.
+    expect(fireEvent).toHaveBeenCalledTimes(1);
+  });
+
+  test('OWNER_LINE_USER_IDS unset: even the configured keyword gets no owner-command reply (safe default)', async () => {
+    const { res } = await postOwnerMessage('U-owner-1', '管理画面', {});
+
+    expect(res.status).toBe(200);
+    expect(lineClientMocks.replyMessage).not.toHaveBeenCalled();
+    expect(fireEvent).toHaveBeenCalledTimes(1);
+  });
+});

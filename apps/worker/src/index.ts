@@ -101,6 +101,13 @@ export type Env = {
     // 未設定なら機能自体が無効化され、従来どおり応答なし (upsertChatOnMessage のみ) になる。
     // Secret は `wrangler secret put GEMINI_API_KEY` で投入する想定。
     GEMINI_API_KEY?: string;
+    // オーナーコマンド (webhook.ts / services/owner-commands.ts)。カンマ区切りの
+    // LINE userId 一覧。ここに含まれる送信者のみ「管理画面」等の固定コマンドに反応する。
+    // 未設定なら機能自体が無効化される (=誰にも反応しない、安全側デフォルト)。
+    // Secret は `wrangler secret put OWNER_LINE_USER_IDS` で投入する想定
+    // (userId 自体は機密情報ではないが、GEMINI_API_KEY 同様 vars ではなく secret 経由にして
+    // wrangler.toml/リポジトリに残さない)。
+    OWNER_LINE_USER_IDS?: string;
     // Phase 5 self-update — consumed by /admin/update/*. Defaults live in
     // wrangler.toml [vars]; secrets (CF_API_TOKEN, ADMIN_API_KEY) come from
     // `wrangler secret put`. All are optional at the type level so the rest

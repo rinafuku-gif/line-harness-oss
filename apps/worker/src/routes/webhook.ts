@@ -25,6 +25,7 @@ import { fireEvent } from '../services/event-bus.js';
 import { buildMessage, expandVariables } from '../services/step-delivery.js';
 import { invokeLLM, isConsultationRateLimited } from '../services/llm.js';
 import { buildConsultationPrompt, CONSULTATION_FALLBACK_MESSAGE } from '../services/consultationPrompt.js';
+import { isOwnerLineUserId, matchOwnerCommand } from '../services/owner-commands.js';
 import type { Env } from '../index.js';
 
 const webhook = new Hono<Env>();
@@ -173,7 +174,7 @@ webhook.post('/webhook', async (c) => {
   const processingPromise = (async () => {
     for (const event of body.events) {
       try {
-        await handleEvent(db, lineClient, event, channelAccessToken, matchedAccountId, c.env.WORKER_URL || new URL(c.req.url).origin, c.env.LIFF_URL, c.env.IMAGES, c.env.GEMINI_API_KEY);
+        await handleEvent(db, lineClient, event, channelAccessToken, matchedAccountId, c.env.WORKER_URL || new URL(c.req.url).origin, c.env.LIFF_URL, c.env.IMAGES, c.env.GEMINI_API_KEY, c.env.OWNER_LINE_USER_IDS);
       } catch (err) {
         console.error('Error handling webhook event:', err);
       }
@@ -195,6 +196,7 @@ async function handleEvent(
   liffUrl?: string,
   r2?: R2Bucket,
   geminiApiKey?: string,
+  ownerLineUserIds?: string,
 ): Promise<void> {
   if (event.type === 'follow') {
     const userId =
@@ -561,6 +563,30 @@ async function handleEvent(
       )
       .bind(logId, friend.id, incomingText, now)
       .run();
+
+    // オーナーコマンド: OWNER_LINE_USER_IDS に登録された送信者だけが対象。
+    // 非オーナーは isOwnerLineUserId() で弾かれ、以降の通常処理 (体験トリガー/自動返信/
+    // AI一次応答) にそのままフォールスルーする — コマンドの存在自体を漏らさないため。
+    if (isOwnerLineUserId(userId, ownerLineUserIds)) {
+      const ownerReply = matchOwnerCommand(incomingText);
+      if (ownerReply) {
+        try {
+          const ownerMsg = buildMessage('text', ownerReply);
+          await lineClient.replyMessage(event.replyToken, [ownerMsg]);
+
+          await db
+            .prepare(
+              `INSERT INTO messages_log (id, friend_id, direction, message_type, content, broadcast_id, scenario_step_id, delivery_type, source, created_at)
+               VALUES (?, ?, 'outgoing', 'text', ?, NULL, NULL, 'reply', 'owner_command', ?)`,
+            )
+            .bind(crypto.randomUUID(), friend.id, ownerReply, jstNow())
+            .run();
+        } catch (err) {
+          console.error('[webhook] owner command reply failed', err);
+        }
+        return;
+      }
+    }
 
     // Cross-account trigger: send message from another account via UUID
     if (incomingText === '体験を完了する' && lineAccountId) {
