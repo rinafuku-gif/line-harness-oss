@@ -53,6 +53,26 @@ vi.mock('../services/llm.js', () => ({
   isConsultationRateLimited: vi.fn(),
 }));
 
+// チャット駆動予約フロー — 大半のテストはセッション未使用の既存パスを検証するため、
+// デフォルトで「セッションなし」を返す。専用テストのみ個別に mockResolvedValueOnce する。
+vi.mock('../services/chatBookingSession.js', () => ({
+  getChatBookingSession: vi.fn().mockResolvedValue(null),
+  upsertChatBookingSession: vi.fn().mockResolvedValue(undefined),
+  clearChatBookingSession: vi.fn().mockResolvedValue(undefined),
+}));
+
+// 外部チャットバックエンド連携 — デフォルトはゲート閉（isChatParityEnabled=false）で
+// 既存Gemini経路のテストに影響しないようにする。専用テストのみ個別に上書きする。
+vi.mock('../services/chatBackend.js', () => ({
+  isChatParityEnabled: vi.fn().mockReturnValue(false),
+  invokeChatBackend: vi.fn(),
+  fetchBookingSlots: vi.fn(),
+  submitBooking: vi.fn(),
+  formatSlotLabel: vi.fn((iso: string) => `label(${iso})`),
+  buildSlotPickerFlexContents: vi.fn().mockReturnValue({ type: 'bubble' }),
+  parseSlotPostbackData: vi.fn().mockReturnValue(null),
+}));
+
 import { verifySignature } from '@line-crm/line-sdk';
 import {
   addTagToFriend,
@@ -76,6 +96,18 @@ import { fireEvent } from '../services/event-bus.js';
 import { buildMessage, messageToLogPayload } from '../services/step-delivery.js';
 import { invokeLLM, isConsultationRateLimited } from '../services/llm.js';
 import { buildConsultationPrompt, CONSULTATION_FALLBACK_MESSAGE } from '../services/consultationPrompt.js';
+import {
+  getChatBookingSession,
+  upsertChatBookingSession,
+  clearChatBookingSession,
+} from '../services/chatBookingSession.js';
+import {
+  isChatParityEnabled,
+  invokeChatBackend,
+  fetchBookingSlots,
+  submitBooking,
+  parseSlotPostbackData,
+} from '../services/chatBackend.js';
 import { webhook } from './webhook.js';
 
 function setupApp() {
@@ -99,6 +131,15 @@ const baseExecutionCtx = {
 beforeEach(() => {
   vi.clearAllMocks();
   vi.mocked(getLineAccounts).mockResolvedValue([]);
+
+  // チャット駆動予約フロー系の mock は複数 describe ブロックで permanent
+  // mockResolvedValue/mockReturnValue を使っているため、vi.clearAllMocks()
+  // だけでは前のテストの実装が漏れる。テストごとに安全なデフォルトへ戻す。
+  vi.mocked(getChatBookingSession).mockResolvedValue(null);
+  vi.mocked(upsertChatBookingSession).mockResolvedValue(undefined);
+  vi.mocked(clearChatBookingSession).mockResolvedValue(undefined);
+  vi.mocked(isChatParityEnabled).mockReturnValue(false);
+  vi.mocked(parseSlotPostbackData).mockReturnValue(null);
 });
 
 describe('POST /webhook — DoS defenses (#104)', () => {
@@ -520,6 +561,598 @@ describe('POST /webhook — AI consultation fallback (Gemini)', () => {
 
     const payload = vi.mocked(fireEvent).mock.calls[0][2] as { replyToken?: string };
     expect(payload.replyToken).toBe(replyToken);
+  });
+});
+
+describe('POST /webhook — chat parity (external chat backend, Ryo限定テストゲート)', () => {
+  const parityTestFriend = {
+    id: 'friend-parity-1',
+    line_user_id: 'U-parity-1',
+    display_name: 'Parity Test Friend',
+    picture_url: null,
+    status_message: null,
+    is_following: 1,
+    user_id: null,
+    line_account_id: null,
+    metadata: '{}',
+    first_tracked_link_id: null,
+    created_at: '2026-07-01T00:00:00.000+09:00',
+    updated_at: '2026-07-01T00:00:00.000+09:00',
+  };
+
+  function makeStmt() {
+    const stmt = {
+      bind: vi.fn(),
+      run: vi.fn().mockResolvedValue({}),
+      all: vi.fn().mockResolvedValue({ results: [] }),
+    };
+    stmt.bind.mockReturnValue(stmt);
+    return stmt;
+  }
+
+  function makeEvent(text: string, replyToken: string) {
+    return {
+      type: 'message',
+      replyToken,
+      message: { type: 'text', id: 'message-parity-1', text },
+      timestamp: Date.now(),
+      source: { type: 'user', userId: 'U-parity-1' },
+      webhookEventId: 'event-parity-1',
+      deliveryContext: { isRedelivery: false },
+      mode: 'active',
+    };
+  }
+
+  async function postParity(envOverrides: Record<string, unknown>, text = '無料相談を予約したい') {
+    const replyToken = 'reply-token-parity';
+    const stmt = makeStmt();
+    const db = { prepare: vi.fn().mockReturnValue(stmt) } as unknown as D1Database;
+    const executionCtx = {
+      waitUntil: vi.fn(),
+      passThroughOnException: vi.fn(),
+      props: {},
+    } as unknown as ExecutionContext;
+
+    const app = setupApp();
+    const validShapedSignature = 'A'.repeat(43) + '=';
+    const res = await app.request(
+      '/webhook',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Line-Signature': validShapedSignature },
+        body: JSON.stringify({ destination: 'bot', events: [makeEvent(text, replyToken)] }),
+      },
+      { ...baseEnv, DB: db, ...envOverrides },
+      executionCtx,
+    );
+
+    const processing = vi.mocked(executionCtx.waitUntil).mock.calls[0]?.[0] as Promise<unknown>;
+    await processing;
+
+    return { res, db, stmt, replyToken };
+  }
+
+  beforeEach(() => {
+    vi.mocked(verifySignature).mockResolvedValue(true);
+    vi.mocked(getFriendByLineUserId).mockResolvedValue(
+      parityTestFriend as unknown as Awaited<ReturnType<typeof getFriendByLineUserId>>,
+    );
+    vi.mocked(jstNow).mockReturnValue('2026-07-01T12:00:00.000+09:00');
+    vi.mocked(getChatBookingSession).mockResolvedValue(null);
+  });
+
+  test('gate closed (isChatParityEnabled=false): never calls the external backend, falls straight to Gemini', async () => {
+    vi.mocked(isChatParityEnabled).mockReturnValue(false);
+    vi.mocked(isConsultationRateLimited).mockResolvedValue(false);
+    vi.mocked(invokeLLM).mockResolvedValue('Gemini fallback reply');
+    vi.mocked(buildMessage).mockReturnValue({ type: 'text', text: 'Gemini fallback reply' });
+    vi.mocked(messageToLogPayload).mockReturnValue({ messageType: 'text', content: 'Gemini fallback reply' });
+
+    const { res } = await postParity({
+      GEMINI_API_KEY: 'test-gemini-key',
+      CHAT_BACKEND_URL: 'https://backend.example',
+      CHAT_BACKEND_SECRET: 'secret',
+      // CHAT_PARITY_TEST_USER_IDS 未設定 → ゲート閉
+    });
+
+    expect(res.status).toBe(200);
+    expect(invokeChatBackend).not.toHaveBeenCalled();
+    expect(invokeLLM).toHaveBeenCalledTimes(1);
+  });
+
+  test('backend not configured (CHAT_BACKEND_URL/SECRET missing) even if gate is open: falls to Gemini without calling the backend', async () => {
+    vi.mocked(isChatParityEnabled).mockReturnValue(true);
+    vi.mocked(isConsultationRateLimited).mockResolvedValue(false);
+    vi.mocked(invokeLLM).mockResolvedValue('Gemini fallback reply');
+    vi.mocked(buildMessage).mockReturnValue({ type: 'text', text: 'Gemini fallback reply' });
+    vi.mocked(messageToLogPayload).mockReturnValue({ messageType: 'text', content: 'Gemini fallback reply' });
+
+    const { res } = await postParity({ GEMINI_API_KEY: 'test-gemini-key' });
+
+    expect(res.status).toBe(200);
+    expect(invokeChatBackend).not.toHaveBeenCalled();
+    expect(invokeLLM).toHaveBeenCalledTimes(1);
+  });
+
+  test('gate open + backend success (book=false): replies with backend text, never touches Gemini', async () => {
+    vi.mocked(isChatParityEnabled).mockReturnValue(true);
+    vi.mocked(invokeChatBackend).mockResolvedValue({ reply: 'Webと同じトーンの返信です', book: false, escalate: false });
+    vi.mocked(buildMessage).mockReturnValue({ type: 'text', text: 'Webと同じトーンの返信です' });
+    vi.mocked(messageToLogPayload).mockReturnValue({ messageType: 'text', content: 'Webと同じトーンの返信です' });
+
+    const { res, replyToken } = await postParity({
+      GEMINI_API_KEY: 'test-gemini-key',
+      CHAT_BACKEND_URL: 'https://backend.example',
+      CHAT_BACKEND_SECRET: 'secret',
+      CHAT_PARITY_TEST_USER_IDS: 'U-parity-1',
+    });
+
+    expect(res.status).toBe(200);
+    expect(invokeChatBackend).toHaveBeenCalledWith({
+      backendUrl: 'https://backend.example',
+      backendSecret: 'secret',
+      lineUserId: 'U-parity-1',
+      message: '無料相談を予約したい',
+    });
+    expect(lineClientMocks.replyMessage).toHaveBeenCalledWith(replyToken, [
+      { type: 'text', text: 'Webと同じトーンの返信です' },
+    ]);
+    expect(invokeLLM).not.toHaveBeenCalled();
+    expect(fetchBookingSlots).not.toHaveBeenCalled();
+  });
+
+  test('gate open + backend success + book=true + slots available: sends reply text + slot picker flex, and opens a booking session', async () => {
+    vi.mocked(isChatParityEnabled).mockReturnValue(true);
+    vi.mocked(invokeChatBackend).mockResolvedValue({ reply: '空いている日時をお伝えしますね', book: true, escalate: false });
+    vi.mocked(fetchBookingSlots).mockResolvedValue({
+      ok: true,
+      slots: [{ start: '2026-08-01T01:00:00.000Z', end: '2026-08-01T01:30:00.000Z' }],
+    });
+    vi.mocked(buildMessage).mockImplementation((type) =>
+      type === 'flex' ? { type: 'flex', altText: 'x', contents: {} } : { type: 'text', text: '空いている日時をお伝えしますね' },
+    );
+    vi.mocked(messageToLogPayload).mockReturnValue({ messageType: 'text', content: 'x' });
+
+    const { res, replyToken } = await postParity({
+      GEMINI_API_KEY: 'test-gemini-key',
+      CHAT_BACKEND_URL: 'https://backend.example',
+      CHAT_BACKEND_SECRET: 'secret',
+      CHAT_PARITY_TEST_USER_IDS: 'U-parity-1',
+    });
+
+    expect(res.status).toBe(200);
+    expect(fetchBookingSlots).toHaveBeenCalledWith({ backendUrl: 'https://backend.example', backendSecret: 'secret' });
+    expect(lineClientMocks.replyMessage).toHaveBeenCalledWith(replyToken, [
+      { type: 'text', text: '空いている日時をお伝えしますね' },
+      { type: 'flex', altText: 'x', contents: {} },
+    ]);
+    expect(upsertChatBookingSession).toHaveBeenCalledWith(expect.anything(), 'friend-parity-1', {
+      state: 'awaiting_slot_selection',
+    });
+  });
+
+  test('gate open + backend throws (timeout/network): falls back to existing Gemini flow, replyToken still gets consumed via fallback text', async () => {
+    vi.mocked(isChatParityEnabled).mockReturnValue(true);
+    vi.mocked(invokeChatBackend).mockRejectedValue(new Error('chat backend error: 500 Internal Server Error'));
+    vi.mocked(isConsultationRateLimited).mockResolvedValue(false);
+    vi.mocked(invokeLLM).mockResolvedValue('Gemini fallback reply');
+    vi.mocked(buildMessage).mockReturnValue({ type: 'text', text: 'Gemini fallback reply' });
+    vi.mocked(messageToLogPayload).mockReturnValue({ messageType: 'text', content: 'Gemini fallback reply' });
+
+    const { res, replyToken } = await postParity({
+      GEMINI_API_KEY: 'test-gemini-key',
+      CHAT_BACKEND_URL: 'https://backend.example',
+      CHAT_BACKEND_SECRET: 'secret',
+      CHAT_PARITY_TEST_USER_IDS: 'U-parity-1',
+    });
+
+    expect(res.status).toBe(200);
+    expect(invokeChatBackend).toHaveBeenCalledTimes(1);
+    expect(invokeLLM).toHaveBeenCalledTimes(1);
+    expect(lineClientMocks.replyMessage).toHaveBeenCalledWith(replyToken, [{ type: 'text', text: 'Gemini fallback reply' }]);
+  });
+
+  test('CHAT_PARITY_ENABLED="all" gate — a user not in CHAT_PARITY_TEST_USER_IDS still gets the new flow', async () => {
+    vi.mocked(isChatParityEnabled).mockReturnValue(true);
+    vi.mocked(invokeChatBackend).mockResolvedValue({ reply: '全開放後の返信', book: false, escalate: false });
+    vi.mocked(buildMessage).mockReturnValue({ type: 'text', text: '全開放後の返信' });
+    vi.mocked(messageToLogPayload).mockReturnValue({ messageType: 'text', content: '全開放後の返信' });
+
+    await postParity({
+      GEMINI_API_KEY: 'test-gemini-key',
+      CHAT_BACKEND_URL: 'https://backend.example',
+      CHAT_BACKEND_SECRET: 'secret',
+      CHAT_PARITY_ENABLED: 'all',
+    });
+
+    expect(isChatParityEnabled).toHaveBeenCalledWith(
+      'U-parity-1',
+      expect.objectContaining({ testUserIds: undefined, parityEnabled: 'all' }),
+    );
+    expect(invokeLLM).not.toHaveBeenCalled();
+  });
+});
+
+describe('POST /webhook — chat booking flow (会話中のセッション)', () => {
+  const bookingFriend = {
+    id: 'friend-booking-1',
+    line_user_id: 'U-booking-1',
+    display_name: 'Booking Flow Friend',
+    picture_url: null,
+    status_message: null,
+    is_following: 1,
+    user_id: null,
+    line_account_id: null,
+    metadata: '{}',
+    first_tracked_link_id: null,
+    created_at: '2026-07-01T00:00:00.000+09:00',
+    updated_at: '2026-07-01T00:00:00.000+09:00',
+  };
+
+  function makeStmt() {
+    const stmt = {
+      bind: vi.fn(),
+      run: vi.fn().mockResolvedValue({}),
+      all: vi.fn().mockResolvedValue({ results: [] }),
+    };
+    stmt.bind.mockReturnValue(stmt);
+    return stmt;
+  }
+
+  function makeEvent(text: string, replyToken: string) {
+    return {
+      type: 'message',
+      replyToken,
+      message: { type: 'text', id: 'message-booking-1', text },
+      timestamp: Date.now(),
+      source: { type: 'user', userId: 'U-booking-1' },
+      webhookEventId: 'event-booking-1',
+      deliveryContext: { isRedelivery: false },
+      mode: 'active',
+    };
+  }
+
+  async function postBookingStep(text: string, envOverrides: Record<string, unknown> = {}) {
+    const replyToken = 'reply-token-booking';
+    const stmt = makeStmt();
+    const db = { prepare: vi.fn().mockReturnValue(stmt) } as unknown as D1Database;
+    const executionCtx = {
+      waitUntil: vi.fn(),
+      passThroughOnException: vi.fn(),
+      props: {},
+    } as unknown as ExecutionContext;
+
+    const app = setupApp();
+    const validShapedSignature = 'A'.repeat(43) + '=';
+    const res = await app.request(
+      '/webhook',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Line-Signature': validShapedSignature },
+        body: JSON.stringify({ destination: 'bot', events: [makeEvent(text, replyToken)] }),
+      },
+      {
+        ...baseEnv,
+        DB: db,
+        CHAT_BACKEND_URL: 'https://backend.example',
+        CHAT_BACKEND_SECRET: 'secret',
+        ...envOverrides,
+      },
+      executionCtx,
+    );
+
+    const processing = vi.mocked(executionCtx.waitUntil).mock.calls[0]?.[0] as Promise<unknown>;
+    await processing;
+
+    return { res, db, stmt, replyToken };
+  }
+
+  beforeEach(() => {
+    vi.mocked(verifySignature).mockResolvedValue(true);
+    vi.mocked(getFriendByLineUserId).mockResolvedValue(
+      bookingFriend as unknown as Awaited<ReturnType<typeof getFriendByLineUserId>>,
+    );
+    vi.mocked(jstNow).mockReturnValue('2026-07-01T12:00:00.000+09:00');
+    vi.mocked(buildMessage).mockImplementation((type, content) => ({ type, text: content } as never));
+    vi.mocked(messageToLogPayload).mockImplementation((m) => ({ messageType: (m as { type: string }).type, content: 'x' }));
+  });
+
+  test('awaiting_name: saves the name and asks for email — never touches auto_replies/Gemini/chat backend', async () => {
+    vi.mocked(getChatBookingSession).mockResolvedValue({
+      friendId: 'friend-booking-1',
+      state: 'awaiting_name',
+      selectedStart: '2026-08-01T01:00:00.000Z',
+      selectedEnd: '2026-08-01T01:30:00.000Z',
+      name: null,
+      updatedAt: '2026-07-01T12:00:00.000',
+    });
+
+    const { res, replyToken } = await postBookingStep('山田太郎');
+
+    expect(res.status).toBe(200);
+    expect(upsertChatBookingSession).toHaveBeenCalledWith(expect.anything(), 'friend-booking-1', {
+      state: 'awaiting_email',
+      name: '山田太郎',
+    });
+    expect(lineClientMocks.replyMessage).toHaveBeenCalledWith(replyToken, [
+      expect.objectContaining({ type: 'text' }),
+    ]);
+    expect(invokeLLM).not.toHaveBeenCalled();
+    expect(invokeChatBackend).not.toHaveBeenCalled();
+  });
+
+  test('awaiting_name: rejects an empty name and re-prompts without advancing the session', async () => {
+    vi.mocked(getChatBookingSession).mockResolvedValue({
+      friendId: 'friend-booking-1',
+      state: 'awaiting_name',
+      selectedStart: '2026-08-01T01:00:00.000Z',
+      selectedEnd: '2026-08-01T01:30:00.000Z',
+      name: null,
+      updatedAt: '2026-07-01T12:00:00.000',
+    });
+
+    await postBookingStep('   ');
+
+    expect(upsertChatBookingSession).not.toHaveBeenCalled();
+  });
+
+  test('awaiting_email: "なし" is treated as no-email and submitBooking is called with email:undefined', async () => {
+    vi.mocked(getChatBookingSession).mockResolvedValue({
+      friendId: 'friend-booking-1',
+      state: 'awaiting_email',
+      selectedStart: '2026-08-01T01:00:00.000Z',
+      selectedEnd: '2026-08-01T01:30:00.000Z',
+      name: '山田太郎',
+      updatedAt: '2026-07-01T12:00:00.000',
+    });
+    vi.mocked(submitBooking).mockResolvedValue({
+      success: true,
+      reservationId: 42,
+      start: '2026-08-01T01:00:00.000Z',
+      end: '2026-08-01T01:30:00.000Z',
+      meetLink: 'https://meet.google.com/abc-defg-hij',
+    });
+
+    await postBookingStep('なし');
+
+    expect(submitBooking).toHaveBeenCalledWith({
+      backendUrl: 'https://backend.example',
+      backendSecret: 'secret',
+      start: '2026-08-01T01:00:00.000Z',
+      name: '山田太郎',
+      email: undefined,
+      lineUserId: 'U-booking-1',
+    });
+    expect(clearChatBookingSession).toHaveBeenCalledWith(expect.anything(), 'friend-booking-1');
+  });
+
+  test('awaiting_email: a real address is passed through to submitBooking as email', async () => {
+    vi.mocked(getChatBookingSession).mockResolvedValue({
+      friendId: 'friend-booking-1',
+      state: 'awaiting_email',
+      selectedStart: '2026-08-01T01:00:00.000Z',
+      selectedEnd: '2026-08-01T01:30:00.000Z',
+      name: '山田太郎',
+      updatedAt: '2026-07-01T12:00:00.000',
+    });
+    vi.mocked(submitBooking).mockResolvedValue({
+      success: true,
+      reservationId: 42,
+      start: '2026-08-01T01:00:00.000Z',
+      end: '2026-08-01T01:30:00.000Z',
+    });
+
+    await postBookingStep('yamada@example.com');
+
+    expect(submitBooking).toHaveBeenCalledWith(
+      expect.objectContaining({ email: 'yamada@example.com' }),
+    );
+  });
+
+  test('awaiting_email: 409 slot_taken re-fetches slots and returns to awaiting_slot_selection while keeping the name', async () => {
+    vi.mocked(getChatBookingSession).mockResolvedValue({
+      friendId: 'friend-booking-1',
+      state: 'awaiting_email',
+      selectedStart: '2026-08-01T01:00:00.000Z',
+      selectedEnd: '2026-08-01T01:30:00.000Z',
+      name: '山田太郎',
+      updatedAt: '2026-07-01T12:00:00.000',
+    });
+    vi.mocked(submitBooking).mockResolvedValue({ success: false, code: 'slot_taken' });
+    vi.mocked(fetchBookingSlots).mockResolvedValue({
+      ok: true,
+      slots: [{ start: '2026-08-02T01:00:00.000Z', end: '2026-08-02T01:30:00.000Z' }],
+    });
+
+    await postBookingStep('なし');
+
+    expect(upsertChatBookingSession).toHaveBeenCalledWith(expect.anything(), 'friend-booking-1', {
+      state: 'awaiting_slot_selection',
+      selectedStart: null,
+      selectedEnd: null,
+    });
+    expect(clearChatBookingSession).not.toHaveBeenCalled();
+  });
+
+  test('awaiting_email: not_configured (503) clears the session and tells the user booking is paused', async () => {
+    vi.mocked(getChatBookingSession).mockResolvedValue({
+      friendId: 'friend-booking-1',
+      state: 'awaiting_email',
+      selectedStart: '2026-08-01T01:00:00.000Z',
+      selectedEnd: '2026-08-01T01:30:00.000Z',
+      name: '山田太郎',
+      updatedAt: '2026-07-01T12:00:00.000',
+    });
+    vi.mocked(submitBooking).mockResolvedValue({ success: false, code: 'not_configured' });
+
+    const { replyToken } = await postBookingStep('なし');
+
+    expect(clearChatBookingSession).toHaveBeenCalledWith(expect.anything(), 'friend-booking-1');
+    expect(lineClientMocks.replyMessage).toHaveBeenCalledWith(replyToken, [
+      expect.objectContaining({ text: expect.stringContaining('停止しております') }),
+    ]);
+  });
+
+  test('reset command "最初から" clears the session regardless of state', async () => {
+    vi.mocked(getChatBookingSession).mockResolvedValue({
+      friendId: 'friend-booking-1',
+      state: 'awaiting_slot_selection',
+      selectedStart: null,
+      selectedEnd: null,
+      name: null,
+      updatedAt: '2026-07-01T12:00:00.000',
+    });
+
+    await postBookingStep('最初から');
+
+    expect(clearChatBookingSession).toHaveBeenCalledWith(expect.anything(), 'friend-booking-1');
+    expect(upsertChatBookingSession).not.toHaveBeenCalled();
+  });
+
+  test('awaiting_slot_selection + unrelated free text: reminds the user to tap a button, does not advance state', async () => {
+    vi.mocked(getChatBookingSession).mockResolvedValue({
+      friendId: 'friend-booking-1',
+      state: 'awaiting_slot_selection',
+      selectedStart: null,
+      selectedEnd: null,
+      name: null,
+      updatedAt: '2026-07-01T12:00:00.000',
+    });
+
+    await postBookingStep('こんにちは');
+
+    expect(upsertChatBookingSession).not.toHaveBeenCalled();
+    expect(clearChatBookingSession).not.toHaveBeenCalled();
+    expect(submitBooking).not.toHaveBeenCalled();
+  });
+});
+
+describe('POST /webhook — chat booking slot selection (postback)', () => {
+  const slotFriend = {
+    id: 'friend-slot-1',
+    line_user_id: 'U-slot-1',
+    display_name: 'Slot Select Friend',
+    picture_url: null,
+    status_message: null,
+    is_following: 1,
+    user_id: null,
+    line_account_id: null,
+    metadata: '{}',
+    first_tracked_link_id: null,
+    created_at: '2026-07-01T00:00:00.000+09:00',
+    updated_at: '2026-07-01T00:00:00.000+09:00',
+  };
+
+  function makeStmt() {
+    const stmt = {
+      bind: vi.fn(),
+      run: vi.fn().mockResolvedValue({}),
+      all: vi.fn().mockResolvedValue({ results: [] }),
+    };
+    stmt.bind.mockReturnValue(stmt);
+    return stmt;
+  }
+
+  function makePostbackEvent(data: string, replyToken: string) {
+    return {
+      type: 'postback',
+      replyToken,
+      postback: { data },
+      timestamp: Date.now(),
+      source: { type: 'user', userId: 'U-slot-1' },
+      webhookEventId: 'event-slot-1',
+      deliveryContext: { isRedelivery: false },
+      mode: 'active',
+    };
+  }
+
+  async function postSlotSelection(data: string) {
+    const replyToken = 'reply-token-slot';
+    const stmt = makeStmt();
+    const db = { prepare: vi.fn().mockReturnValue(stmt) } as unknown as D1Database;
+    const executionCtx = {
+      waitUntil: vi.fn(),
+      passThroughOnException: vi.fn(),
+      props: {},
+    } as unknown as ExecutionContext;
+
+    const app = setupApp();
+    const validShapedSignature = 'A'.repeat(43) + '=';
+    const res = await app.request(
+      '/webhook',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Line-Signature': validShapedSignature },
+        body: JSON.stringify({ destination: 'bot', events: [makePostbackEvent(data, replyToken)] }),
+      },
+      { ...baseEnv, DB: db },
+      executionCtx,
+    );
+
+    const processing = vi.mocked(executionCtx.waitUntil).mock.calls[0]?.[0] as Promise<unknown>;
+    await processing;
+
+    return { res, db, stmt, replyToken };
+  }
+
+  beforeEach(() => {
+    vi.mocked(verifySignature).mockResolvedValue(true);
+    vi.mocked(getFriendByLineUserId).mockResolvedValue(
+      slotFriend as unknown as Awaited<ReturnType<typeof getFriendByLineUserId>>,
+    );
+    vi.mocked(jstNow).mockReturnValue('2026-07-01T12:00:00.000+09:00');
+    vi.mocked(buildMessage).mockImplementation((type, content) => ({ type, text: content } as never));
+    vi.mocked(messageToLogPayload).mockReturnValue({ messageType: 'text', content: 'x' });
+  });
+
+  test('unrelated postback data (parseSlotPostbackData → null) falls through to normal auto_replies handling', async () => {
+    vi.mocked(parseSlotPostbackData).mockReturnValue(null);
+
+    const { res } = await postSlotSelection('コスト比較');
+
+    expect(res.status).toBe(200);
+    expect(getChatBookingSession).not.toHaveBeenCalled();
+  });
+
+  test('slot postback with no existing session (fresh flow): asks for name', async () => {
+    vi.mocked(parseSlotPostbackData).mockReturnValue({
+      start: '2026-08-01T01:00:00.000Z',
+      end: '2026-08-01T01:30:00.000Z',
+    });
+    vi.mocked(getChatBookingSession).mockResolvedValue(null);
+
+    const { res, replyToken } = await postSlotSelection('CHATBOOK_SLOT:2026-08-01T01:00:00.000Z|2026-08-01T01:30:00.000Z');
+
+    expect(res.status).toBe(200);
+    expect(upsertChatBookingSession).toHaveBeenCalledWith(expect.anything(), 'friend-slot-1', {
+      state: 'awaiting_name',
+      selectedStart: '2026-08-01T01:00:00.000Z',
+      selectedEnd: '2026-08-01T01:30:00.000Z',
+    });
+    expect(lineClientMocks.replyMessage).toHaveBeenCalledWith(replyToken, [expect.objectContaining({ type: 'text' })]);
+  });
+
+  test('slot postback with a session that already has a name (409 re-selection): skips straight to email', async () => {
+    vi.mocked(parseSlotPostbackData).mockReturnValue({
+      start: '2026-08-02T01:00:00.000Z',
+      end: '2026-08-02T01:30:00.000Z',
+    });
+    vi.mocked(getChatBookingSession).mockResolvedValue({
+      friendId: 'friend-slot-1',
+      state: 'awaiting_slot_selection',
+      selectedStart: null,
+      selectedEnd: null,
+      name: '山田太郎',
+      updatedAt: '2026-07-01T12:00:00.000',
+    });
+
+    await postSlotSelection('CHATBOOK_SLOT:2026-08-02T01:00:00.000Z|2026-08-02T01:30:00.000Z');
+
+    expect(upsertChatBookingSession).toHaveBeenCalledWith(expect.anything(), 'friend-slot-1', {
+      state: 'awaiting_email',
+      selectedStart: '2026-08-02T01:00:00.000Z',
+      selectedEnd: '2026-08-02T01:30:00.000Z',
+    });
   });
 });
 

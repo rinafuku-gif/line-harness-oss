@@ -108,6 +108,19 @@ export type Env = {
     // (userId 自体は機密情報ではないが、GEMINI_API_KEY 同様 vars ではなく secret 経由にして
     // wrangler.toml/リポジトリに残さない)。
     OWNER_LINE_USER_IDS?: string;
+    // 外部チャットバックエンド連携 (webhook.ts / services/chatBackend.ts)。
+    // 相談窓口AI一次応答をWebチャットと同一人格にするための汎用オプション機能。
+    // CHAT_BACKEND_URL/CHAT_BACKEND_SECRET のどちらかが未設定なら機能自体が無効化され、
+    // 既存の GEMINI_API_KEY 単発フォールバックに完全に倒れる。
+    // Secret は `wrangler secret put CHAT_BACKEND_URL` / `CHAT_BACKEND_SECRET` で投入する想定。
+    CHAT_BACKEND_URL?: string;
+    CHAT_BACKEND_SECRET?: string;
+    // Ryo限定テストゲート — カンマ区切りの line_user_id。ここに含まれる送信者のみ
+    // CHAT_BACKEND_* を使った新フローを使う。他の友だちは従来のGemini単発応答のまま
+    // (=本番の他ユーザーに一切影響しない)。全開放する場合は CHAT_PARITY_ENABLED='all'。
+    // Secret は `wrangler secret put CHAT_PARITY_TEST_USER_IDS` で投入する想定。
+    CHAT_PARITY_TEST_USER_IDS?: string;
+    CHAT_PARITY_ENABLED?: string;
     // Phase 5 self-update — consumed by /admin/update/*. Defaults live in
     // wrangler.toml [vars]; secrets (CF_API_TOKEN, ADMIN_API_KEY) come from
     // `wrangler secret put`. All are optional at the type level so the rest

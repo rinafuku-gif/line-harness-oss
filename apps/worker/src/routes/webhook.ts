@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import { verifySignature, LineClient } from '@line-crm/line-sdk';
-import type { WebhookRequestBody, WebhookEvent, TextEventMessage } from '@line-crm/line-sdk';
+import type { WebhookRequestBody, WebhookEvent, TextEventMessage, Message } from '@line-crm/line-sdk';
 import { createStickerMessageContent } from '@line-crm/shared';
 import {
   upsertFriend,
@@ -26,7 +26,31 @@ import { buildMessage, expandVariables } from '../services/step-delivery.js';
 import { invokeLLM, isConsultationRateLimited } from '../services/llm.js';
 import { buildConsultationPrompt, CONSULTATION_FALLBACK_MESSAGE } from '../services/consultationPrompt.js';
 import { isOwnerLineUserId, matchOwnerCommand } from '../services/owner-commands.js';
+import {
+  isChatParityEnabled,
+  invokeChatBackend,
+  fetchBookingSlots,
+  submitBooking,
+  formatSlotLabel,
+  buildSlotPickerFlexContents,
+  parseSlotPostbackData,
+  type BookingSlot,
+} from '../services/chatBackend.js';
+import {
+  getChatBookingSession,
+  upsertChatBookingSession,
+  clearChatBookingSession,
+  type ChatBookingSession,
+} from '../services/chatBookingSession.js';
 import type { Env } from '../index.js';
+
+/** webhook.ts 内から handleEvent 系関数へ渡す、外部チャットバックエンド関連の env 束。 */
+interface ChatBackendEnv {
+  backendUrl?: string;
+  backendSecret?: string;
+  testUserIds?: string;
+  parityEnabled?: string;
+}
 
 const webhook = new Hono<Env>();
 
@@ -81,6 +105,214 @@ async function ensureFriendFromWebhookUser(
   }
 
   return friend;
+}
+
+// ─── チャット駆動予約フロー（外部チャットバックエンド連携） ─────────────────
+//
+// 空き枠提示 → 日時選択(postback) → 氏名/メール収集(text) → 確定 の一連の流れを
+// 扱うヘルパー群。会話状態は services/chatBookingSession.ts (D1) が正本、
+// AI応答そのものは外部バックエンド (services/chatBackend.ts) が正本。
+
+async function logOutgoingMessage(
+  db: D1Database,
+  friendId: string,
+  payload: { messageType: string; content: string },
+  source: string,
+): Promise<void> {
+  try {
+    await db
+      .prepare(
+        `INSERT INTO messages_log (id, friend_id, direction, message_type, content, broadcast_id, scenario_step_id, delivery_type, source, created_at)
+         VALUES (?, ?, 'outgoing', ?, ?, NULL, NULL, 'reply', ?, ?)`,
+      )
+      .bind(crypto.randomUUID(), friendId, payload.messageType, payload.content, source, jstNow())
+      .run();
+  } catch (err) {
+    console.error('[webhook] failed to log outgoing chat-booking message', err);
+  }
+}
+
+async function sendReplyAndLog(
+  lineClient: LineClient,
+  db: D1Database,
+  friendId: string,
+  replyToken: string,
+  messages: Message[],
+  source: string,
+): Promise<void> {
+  await lineClient.replyMessage(replyToken, messages);
+  const { messageToLogPayload } = await import('../services/step-delivery.js');
+  for (const msg of messages) {
+    await logOutgoingMessage(db, friendId, messageToLogPayload(msg), source);
+  }
+}
+
+/** 日時選択(postback)を受けた直後の処理。氏名が既知(409再選択等)ならメール収集へ直行する。 */
+async function handleChatBookingSlotSelection(
+  db: D1Database,
+  lineClient: LineClient,
+  replyToken: string,
+  friend: Friend,
+  slot: BookingSlot,
+): Promise<void> {
+  const session = await getChatBookingSession(db, friend.id);
+  const label = formatSlotLabel(slot.start);
+
+  if (session?.name) {
+    await upsertChatBookingSession(db, friend.id, {
+      state: 'awaiting_email',
+      selectedStart: slot.start,
+      selectedEnd: slot.end,
+    });
+    const msg = buildMessage(
+      'text',
+      `${label} で承ります。\nメールアドレスは分かりますか？（確認メールをお送りします。なければ「なし」とお送りください）`,
+    );
+    await sendReplyAndLog(lineClient, db, friend.id, replyToken, [msg], 'chat_booking_flow');
+    return;
+  }
+
+  await upsertChatBookingSession(db, friend.id, {
+    state: 'awaiting_name',
+    selectedStart: slot.start,
+    selectedEnd: slot.end,
+  });
+  const msg = buildMessage('text', `${label} で承ります。\nお名前を教えてください。`);
+  await sendReplyAndLog(lineClient, db, friend.id, replyToken, [msg], 'chat_booking_flow');
+}
+
+const CHAT_BOOKING_RESET_COMMANDS = ['最初から', 'キャンセル'];
+const CHAT_BOOKING_NO_EMAIL_KEYWORDS = ['なし', 'ない', '無し', 'skip', 'スキップ'];
+
+/** セッション進行中に届いたテキストメッセージ（氏名/メール入力・リセット・迷子ガード）を処理する。 */
+async function handleChatBookingTextStep(
+  db: D1Database,
+  lineClient: LineClient,
+  replyToken: string,
+  friend: Friend,
+  session: ChatBookingSession,
+  chatEnv: Pick<ChatBackendEnv, 'backendUrl' | 'backendSecret'>,
+  incomingText: string,
+): Promise<void> {
+  const trimmed = incomingText.trim();
+
+  if (CHAT_BOOKING_RESET_COMMANDS.includes(trimmed)) {
+    await clearChatBookingSession(db, friend.id);
+    const msg = buildMessage(
+      'text',
+      '予約の入力を最初からやり直します。改めて「無料相談を予約したい」とお送りください。',
+    );
+    await sendReplyAndLog(lineClient, db, friend.id, replyToken, [msg], 'chat_booking_flow');
+    return;
+  }
+
+  if (session.state === 'awaiting_slot_selection') {
+    const msg = buildMessage(
+      'text',
+      '上に表示された候補からタップして日時を選んでください。\nやり直す場合は「最初から」とお送りください。',
+    );
+    await sendReplyAndLog(lineClient, db, friend.id, replyToken, [msg], 'chat_booking_flow');
+    return;
+  }
+
+  if (session.state === 'awaiting_name') {
+    if (trimmed.length < 1 || trimmed.length > 255) {
+      const msg = buildMessage('text', 'お名前を1〜255文字で教えてください。');
+      await sendReplyAndLog(lineClient, db, friend.id, replyToken, [msg], 'chat_booking_flow');
+      return;
+    }
+    await upsertChatBookingSession(db, friend.id, { state: 'awaiting_email', name: trimmed });
+    const msg = buildMessage(
+      'text',
+      'メールアドレスは分かりますか？（確認メールをお送りします。なければ「なし」とお送りください）',
+    );
+    await sendReplyAndLog(lineClient, db, friend.id, replyToken, [msg], 'chat_booking_flow');
+    return;
+  }
+
+  // state === 'awaiting_email'
+  if (!session.selectedStart || !session.name) {
+    // 想定外の状態崩れ（バグ防御）。安全にリセットしてやり直しを促す。
+    await clearChatBookingSession(db, friend.id);
+    const msg = buildMessage(
+      'text',
+      '入力内容を確認できませんでした。恐れ入りますが「無料相談を予約したい」と改めてお送りください。',
+    );
+    await sendReplyAndLog(lineClient, db, friend.id, replyToken, [msg], 'chat_booking_flow');
+    return;
+  }
+
+  if (!chatEnv.backendUrl || !chatEnv.backendSecret) {
+    await clearChatBookingSession(db, friend.id);
+    const msg = buildMessage('text', '只今予約処理を行えませんでした。お手数ですが担当者へ直接ご連絡ください。');
+    await sendReplyAndLog(lineClient, db, friend.id, replyToken, [msg], 'chat_booking_flow');
+    return;
+  }
+
+  const email = CHAT_BOOKING_NO_EMAIL_KEYWORDS.includes(trimmed) ? undefined : trimmed;
+
+  const result = await submitBooking({
+    backendUrl: chatEnv.backendUrl,
+    backendSecret: chatEnv.backendSecret,
+    start: session.selectedStart,
+    name: session.name,
+    email,
+    lineUserId: friend.line_user_id,
+  });
+
+  if (result.success) {
+    await clearChatBookingSession(db, friend.id);
+    const label = formatSlotLabel(result.start);
+    const meetLine = result.meetLink
+      ? `オンライン相談リンク: ${result.meetLink}`
+      : '相談方法は担当者から改めてご連絡します。';
+    const msg = buildMessage(
+      'text',
+      `ご予約を承りました。\n\n日時: ${label}\n${meetLine}\n\nご不明点があれば、このトーク画面からいつでもご連絡ください。`,
+    );
+    await sendReplyAndLog(lineClient, db, friend.id, replyToken, [msg], 'chat_booking_flow');
+    return;
+  }
+
+  if (result.code === 'slot_taken') {
+    const slotsResult = await fetchBookingSlots({
+      backendUrl: chatEnv.backendUrl,
+      backendSecret: chatEnv.backendSecret,
+    });
+    if (slotsResult.ok && slotsResult.slots.length > 0) {
+      await upsertChatBookingSession(db, friend.id, {
+        state: 'awaiting_slot_selection',
+        selectedStart: null,
+        selectedEnd: null,
+      });
+      const textMsg = buildMessage(
+        'text',
+        'せっかくお選びいただきましたが、その枠はちょうど埋まってしまったようです。改めて空き枠をお送りします。',
+      );
+      const flexMsg = buildMessage(
+        'flex',
+        JSON.stringify(buildSlotPickerFlexContents(slotsResult.slots)),
+        '空いている日時を選択してください',
+      );
+      await sendReplyAndLog(lineClient, db, friend.id, replyToken, [textMsg, flexMsg], 'chat_booking_flow');
+    } else {
+      await clearChatBookingSession(db, friend.id);
+      const msg = buildMessage(
+        'text',
+        'せっかくお選びいただきましたが、その枠はちょうど埋まってしまったようです。恐れ入りますが、改めて「無料相談を予約したい」とお送りください。',
+      );
+      await sendReplyAndLog(lineClient, db, friend.id, replyToken, [msg], 'chat_booking_flow');
+    }
+    return;
+  }
+
+  await clearChatBookingSession(db, friend.id);
+  const errorText =
+    result.code === 'not_configured'
+      ? '現在、オンラインでの予約受付を停止しております。恐れ入りますが、担当者からのご連絡をお待ちください。'
+      : '只今予約処理でエラーが発生しました。お手数ですが、少し時間をおいて改めてお試しください。';
+  const msg = buildMessage('text', errorText);
+  await sendReplyAndLog(lineClient, db, friend.id, replyToken, [msg], 'chat_booking_flow');
 }
 
 webhook.post('/webhook', async (c) => {
@@ -172,9 +404,15 @@ webhook.post('/webhook', async (c) => {
 
   // 非同期処理 — LINE は ~1s 以内のレスポンスを要求
   const processingPromise = (async () => {
+    const chatBackendEnv: ChatBackendEnv = {
+      backendUrl: c.env.CHAT_BACKEND_URL,
+      backendSecret: c.env.CHAT_BACKEND_SECRET,
+      testUserIds: c.env.CHAT_PARITY_TEST_USER_IDS,
+      parityEnabled: c.env.CHAT_PARITY_ENABLED,
+    };
     for (const event of body.events) {
       try {
-        await handleEvent(db, lineClient, event, channelAccessToken, matchedAccountId, c.env.WORKER_URL || new URL(c.req.url).origin, c.env.LIFF_URL, c.env.IMAGES, c.env.GEMINI_API_KEY, c.env.OWNER_LINE_USER_IDS);
+        await handleEvent(db, lineClient, event, channelAccessToken, matchedAccountId, c.env.WORKER_URL || new URL(c.req.url).origin, c.env.LIFF_URL, c.env.IMAGES, c.env.GEMINI_API_KEY, c.env.OWNER_LINE_USER_IDS, chatBackendEnv);
       } catch (err) {
         console.error('Error handling webhook event:', err);
       }
@@ -197,6 +435,7 @@ async function handleEvent(
   r2?: R2Bucket,
   geminiApiKey?: string,
   ownerLineUserIds?: string,
+  chatBackendEnv: ChatBackendEnv = {},
 ): Promise<void> {
   if (event.type === 'follow') {
     const userId =
@@ -428,6 +667,19 @@ async function handleEvent(
       console.error('Failed to log incoming postback', err);
     }
 
+    // チャット駆動予約フロー — 空き枠選択ボタンの postback は auto_replies を通さず
+    // 専用ハンドラで処理する（氏名/メール収集ステップへ進める）。
+    const chatBookingSlot = parseSlotPostbackData(postbackData);
+    if (chatBookingSlot) {
+      try {
+        await handleChatBookingSlotSelection(db, lineClient, event.replyToken, friend, chatBookingSlot);
+      } catch (err) {
+        console.error('[webhook] chat booking slot selection failed', err);
+        await clearChatBookingSession(db, friend.id).catch(() => undefined);
+      }
+      return;
+    }
+
     for (const rule of autoReplies.results) {
       const isMatch = rule.match_type === 'exact'
         ? postbackData === rule.keyword
@@ -640,6 +892,32 @@ async function handleEvent(
       }
     }
 
+    // チャット駆動予約フロー — 進行中のセッションがあれば最優先で処理し、
+    // auto_replies / AI一次応答には進まない（氏名入力等をキーワードマッチや
+    // AI応答に誤って回さないため）。常に replyToken を消費する。
+    const chatBookingSession = await getChatBookingSession(db, friend.id);
+    if (chatBookingSession) {
+      try {
+        await handleChatBookingTextStep(
+          db,
+          lineClient,
+          event.replyToken,
+          friend,
+          chatBookingSession,
+          chatBackendEnv,
+          incomingText,
+        );
+      } catch (err) {
+        console.error('[webhook] chat booking text step failed', err);
+        await clearChatBookingSession(db, friend.id).catch(() => undefined);
+      }
+      await fireEvent(db, 'message_received', {
+        friendId: friend.id,
+        eventData: { text: incomingText, matched: true },
+      }, lineAccessToken, lineAccountId);
+      return;
+    }
+
     // 自動返信チェック（このアカウントのルール + グローバルルールのみ）
     // NOTE: Auto-replies use replyMessage (free, no quota) instead of pushMessage
     // The replyToken is only valid for ~1 minute after the message event
@@ -713,6 +991,74 @@ async function handleEvent(
     if (!matched) {
       await upsertChatOnMessage(db, friend.id);
 
+      // 外部チャットバックエンド連携（Ryo限定テストゲート・CHAT_PARITY_TEST_USER_IDS）。
+      // Webチャットと同一プロンプト/予約誘導ロジックで応答する新フロー。ゲート対象外
+      // or バックエンド未設定 or 呼び出し失敗時は、下の既存Gemini単発応答へ完全に
+      // フォールバックする（本番の他ユーザーの挙動には一切影響しない・安全側)。
+      let handledByChatParity = false;
+      if (
+        chatBackendEnv.backendUrl &&
+        chatBackendEnv.backendSecret &&
+        isChatParityEnabled(userId, chatBackendEnv)
+      ) {
+        const parityStart = Date.now();
+        try {
+          const backendReply = await invokeChatBackend({
+            backendUrl: chatBackendEnv.backendUrl,
+            backendSecret: chatBackendEnv.backendSecret,
+            lineUserId: userId,
+            message: incomingText,
+          });
+          console.log(`[webhook][perf] chat backend invoke: ${Date.now() - parityStart}ms`);
+
+          const messagesToSend: Message[] = [buildMessage('text', backendReply.reply)];
+
+          if (backendReply.book) {
+            const slotsResult = await fetchBookingSlots({
+              backendUrl: chatBackendEnv.backendUrl,
+              backendSecret: chatBackendEnv.backendSecret,
+            });
+            if (slotsResult.ok && slotsResult.slots.length > 0) {
+              messagesToSend.push(
+                buildMessage(
+                  'flex',
+                  JSON.stringify(buildSlotPickerFlexContents(slotsResult.slots)),
+                  '空いている日時を選択してください',
+                ),
+              );
+              await upsertChatBookingSession(db, friend.id, { state: 'awaiting_slot_selection' });
+            } else if (slotsResult.ok) {
+              // 空き枠0件 — フローには入らず、担当者フォローに委ねる（返信テキストのみ送信）。
+              console.log(`[webhook] chat parity book=true but no slots available friendId=${friend.id}`);
+            } else if (slotsResult.reason === 'not_configured' && slotsResult.message) {
+              messagesToSend.push(buildMessage('text', slotsResult.message));
+            } else {
+              console.error('[webhook] chat parity slots fetch failed', slotsResult);
+            }
+          }
+
+          if (backendReply.escalate) {
+            // Ryo宛の通知は satoyama 側で送信済み（契約: docs/line-booking-integration.md §3.3）。
+            // Harness側での追加送信は不要。観測用にログのみ残す。
+            console.log(`[webhook] chat parity escalate=true friendId=${friend.id}`);
+          }
+
+          await lineClient.replyMessage(event.replyToken, messagesToSend);
+          replyTokenConsumed = true;
+          handledByChatParity = true;
+
+          const { messageToLogPayload: logPayloadChatParity } = await import('../services/step-delivery.js');
+          for (const sentMsg of messagesToSend) {
+            await logOutgoingMessage(db, friend.id, logPayloadChatParity(sentMsg), 'ai_consultation');
+          }
+        } catch (err) {
+          console.error(
+            `[webhook] chat parity backend failed after ${Date.now() - parityStart}ms, falling back to existing consultation`,
+            err,
+          );
+        }
+      }
+
       // 相談窓口 AI 一次応答 (Gemini)。GEMINI_API_KEY 未設定 / レート超過時は何もせず
       // 従来どおり応答なし (fireEvent 側の通知のみ) にフォールバックする。
       // LLM生成そのものが失敗/タイムアウト/MAX_TOKENS切れした場合は、中途半端な文を
@@ -720,7 +1066,7 @@ async function handleEvent(
       // （無応答よりユーザー体験が良く、replyToken を確実に消費できる）。
       // replyToken を消費した場合のみ replyTokenConsumed=true にし、下の fireEvent には
       // 渡さない（二重消費防止）。
-      if (geminiApiKey) {
+      if (!handledByChatParity && geminiApiKey) {
         // レイテンシ計測（30秒問題の内訳特定用・恒久計装）。D1レート制限クエリ /
         // Gemini生成 / LINE reply の各区間でどこが支配的かを wrangler tail で
         // 追えるようにする。本番トラフィック量はレート制限 (60秒3件) で自然に
