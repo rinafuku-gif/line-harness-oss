@@ -909,13 +909,12 @@ describe('POST /webhook — chat parity (external chat backend, Ryo限定テス�
     expect(upsertChatBookingSession).not.toHaveBeenCalled();
   });
 
-  test('gate open + backend throws (timeout/network): falls back to existing Gemini flow, replyToken still gets consumed via fallback text', async () => {
+  test('gate open + backend throws (timeout/network): sends the generic retry fallback + default quick replies, does NOT fall through to the legacy free-form Gemini flow (2026-07-17 21:42 JST 実機事故の再発防止)', async () => {
     vi.mocked(isChatParityEnabled).mockReturnValue(true);
     vi.mocked(invokeChatBackend).mockRejectedValue(new Error('chat backend error: 500 Internal Server Error'));
     vi.mocked(isConsultationRateLimited).mockResolvedValue(false);
-    vi.mocked(invokeLLM).mockResolvedValue('Gemini fallback reply');
-    vi.mocked(buildMessage).mockReturnValue({ type: 'text', text: 'Gemini fallback reply' });
-    vi.mocked(messageToLogPayload).mockReturnValue({ messageType: 'text', content: 'Gemini fallback reply' });
+    vi.mocked(buildMessage).mockReturnValue({ type: 'text', text: CONSULTATION_FALLBACK_MESSAGE });
+    vi.mocked(messageToLogPayload).mockReturnValue({ messageType: 'text', content: CONSULTATION_FALLBACK_MESSAGE });
 
     const { res, replyToken } = await postParity({
       GEMINI_API_KEY: 'test-gemini-key',
@@ -926,8 +925,22 @@ describe('POST /webhook — chat parity (external chat backend, Ryo限定テス�
 
     expect(res.status).toBe(200);
     expect(invokeChatBackend).toHaveBeenCalledTimes(1);
-    expect(invokeLLM).toHaveBeenCalledTimes(1);
-    expect(lineClientMocks.replyMessage).toHaveBeenCalledWith(replyToken, [{ type: 'text', text: 'Gemini fallback reply' }]);
+    // 事業固有のトーンを持たない汎用Gemini経路（buildConsultationPrompt/invokeLLM）には
+    // 一切流れない。line-harness-ossはOSS公開forkであり事業固有の文面を持たない設計のため。
+    expect(invokeLLM).not.toHaveBeenCalled();
+    expect(lineClientMocks.replyMessage).toHaveBeenCalledWith(replyToken, [
+      {
+        type: 'text',
+        text: CONSULTATION_FALLBACK_MESSAGE,
+        quickReply: {
+          items: [
+            { type: 'action', action: { type: 'message', label: 'もっと詳しく', text: 'もっと詳しく' } },
+            { type: 'action', action: { type: 'message', label: '別のことを相談する', text: '別のことを相談する' } },
+            { type: 'action', action: { type: 'message', label: '無料相談を予約する', text: '無料相談を予約する' } },
+          ],
+        },
+      },
+    ]);
   });
 
   test('gate open + backend returns quickReplies: attaches a LINE quick reply to the text message (2026-07-17追加)', async () => {

@@ -12,7 +12,15 @@
  * バック（services/llm.ts の単発Gemini応答）に倒すこと。
  */
 
-const CHAT_BACKEND_TIMEOUT_MS = 8_000;
+// 2026-07-17 21:42 JST 実機事故を受けて 8_000 → 15_000 に引き上げ。satoyama-ai-base
+// (Vercel) 側は LLM生成＋DB書き込みを含み、コールドスタート時は 8秒を超えることがある。
+// 8秒で打ち切ると、satoyama側は裏でそのまま生成・DB保存を完了させる一方
+// （lineChatRoute.ts はレスポンス送信前にconversations書き込みをawaitする設計）、
+// Harness側だけが「バックエンド失敗」と誤判定してエスカレーション文言に落ちる
+// タイミング競合が発生した（DB上には正常な応答が残るのにユーザーには別の
+// フォールバック文が届く）。LINEのreplyTokenの実用上の猶予（数十秒）内に収まる
+// 範囲で余裕を持たせる。
+const CHAT_BACKEND_TIMEOUT_MS = 15_000;
 const BOOKING_TIMEOUT_MS = 8_000;
 
 function joinUrl(base: string, path: string): string {

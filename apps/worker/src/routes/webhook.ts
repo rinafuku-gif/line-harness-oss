@@ -1279,9 +1279,36 @@ async function handleEvent(
             }
           } catch (err) {
             console.error(
-              `[webhook] chat parity backend failed after ${Date.now() - parityStart}ms, falling back to existing consultation`,
+              `[webhook] chat parity backend failed after ${Date.now() - parityStart}ms, sending generic retry fallback`,
               err,
             );
+
+            // 2026-07-17 21:42 JST 実機事故の再発防止。
+            // parity対象ユーザーでバックエンド呼び出しが失敗/タイムアウトした際、
+            // 従来は下の「相談窓口 AI 一次応答 (Gemini)」（buildConsultationPrompt）に
+            // そのまま流れ込んでいた。あのプロンプトはOSS汎用の「受付窓口」トーン
+            // 固定文（「担当者が確認のうえ改めてご連絡します」という趣旨で伝える指示）
+            // を持ち、事業固有のポリシー（担当者への取り次ぎを匂わせない等）と衝突しうる
+            // 上、テキストのみでクイックリプライが付かない（このリポジトリは事業固有の
+            // 文面を持たない設計＝上記ファイル冒頭コメント参照。なので新たに事業文言を
+            // ここに書き足すのではなく、既存の汎用フォールバック文
+            // (CONSULTATION_FALLBACK_MESSAGE) を使い、構造的にクイックリプライだけ
+            // 必ず添付する）。
+            try {
+              const fallbackMsg = withQuickReply(
+                buildMessage('text', CONSULTATION_FALLBACK_MESSAGE),
+                quickReply(buildQuickReplyItems(resolveQuickReplyOptions(undefined, false))),
+              );
+              await lineClient.replyMessage(event.replyToken, [fallbackMsg]);
+              replyTokenConsumed = true;
+              handledByChatParity = true;
+
+              const { messageToLogPayload: logPayloadParityFallback } = await import('../services/step-delivery.js');
+              await logOutgoingMessage(db, friend.id, logPayloadParityFallback(fallbackMsg), 'ai_consultation_fallback');
+            } catch (fallbackErr) {
+              // 送信自体も失敗した場合のみ、既存の安全網（下の汎用Geminiフロー）に委ねる。
+              console.error('[webhook] chat parity fallback reply also failed, falling through to legacy consultation', fallbackErr);
+            }
           }
         }
       }
