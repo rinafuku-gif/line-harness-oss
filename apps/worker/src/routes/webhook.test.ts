@@ -1254,7 +1254,7 @@ describe('POST /webhook — owner command ("管理画面")', () => {
     expect(lineClientMocks.replyMessage).toHaveBeenCalledWith(replyToken, [
       {
         type: 'text',
-        text: 'https://satoyama-ai-base.vercel.app/admin\n\n※LINE内で開けない場合は、外部ブラウザ（Safari/Chrome等）で開いてログインしてください。',
+        text: 'https://satoyama-ai-base.vercel.app/admin?openExternalBrowser=1\n\n※LINE内で開けない場合は、外部ブラウザ（Safari/Chrome等）で開いてログインしてください。',
       },
     ]);
     // Short-circuits before the normal message pipeline (no unread/AI-consultation side effects).
@@ -1282,7 +1282,7 @@ describe('POST /webhook — owner command ("管理画面")', () => {
 
       expect(res.status).toBe(200);
       expect(lineClientMocks.replyMessage).toHaveBeenCalledWith(replyToken, [
-        { type: 'text', text: 'https://satoyama-ai-base.vercel.app/admin-login?token=one-time-token' },
+        { type: 'text', text: 'https://satoyama-ai-base.vercel.app/admin-login?token=one-time-token&openExternalBrowser=1' },
       ]);
       expect(fetch).toHaveBeenCalledTimes(1);
       const [url, init] = vi.mocked(fetch).mock.calls[0];
@@ -1315,7 +1315,7 @@ describe('POST /webhook — owner command ("管理画面")', () => {
       expect(lineClientMocks.replyMessage).toHaveBeenCalledWith(replyToken, [
         {
           type: 'text',
-          text: 'https://satoyama-ai-base.vercel.app/admin\n\n※LINE内で開けない場合は、外部ブラウザ（Safari/Chrome等）で開いてログインしてください。',
+          text: 'https://satoyama-ai-base.vercel.app/admin?openExternalBrowser=1\n\n※LINE内で開けない場合は、外部ブラウザ（Safari/Chrome等）で開いてログインしてください。',
         },
       ]);
     } finally {

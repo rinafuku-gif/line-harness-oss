@@ -19,8 +19,23 @@
 
 const ADMIN_MAGIC_LINK_TIMEOUT_MS = 8_000;
 
-/** 発行APIが使えない場合のフォールバック先（従来の固定URL）。 */
-export const ADMIN_DASHBOARD_STATIC_URL = 'https://satoyama-ai-base.vercel.app/admin';
+/**
+ * URLに `openExternalBrowser=1` を付与する。LINEはこのパラメータ付きURLをタップされた際、
+ * 内蔵WebView（in-app browser）ではなくOS標準ブラウザ（Safari/Chrome）で開く。
+ *
+ * 管理画面SPA（satoyama-ai-base.vercel.app）はLINE内蔵WebViewで開くとホワイトアウトして
+ * 何も表示されない既知の不具合がある（Ryo報告 2026-07-17）。ワンタイム入場リンク（magic
+ * link）も同一オリジン・同一SPA配信経路のため同じ制約を受けるので、固定URLフォールバック
+ * だけでなく発行成功時のmagic link URLにも常にこのパラメータを付与する。
+ * (参照: services/auto-track.ts の appendOpenExternalBrowser と同じ定石)
+ */
+function withExternalBrowser(url: string): string {
+  if (url.includes('openExternalBrowser=')) return url;
+  return `${url}${url.includes('?') ? '&' : '?'}openExternalBrowser=1`;
+}
+
+/** 発行APIが使えない場合のフォールバック先（従来の固定URL・外部ブラウザ強制付き）。 */
+export const ADMIN_DASHBOARD_STATIC_URL = 'https://satoyama-ai-base.vercel.app/admin?openExternalBrowser=1';
 
 /**
  * フォールバック時の案内文。固定URLはLINE内蔵ブラウザではログインフォームが動作しない
@@ -68,7 +83,7 @@ export async function requestAdminMagicLinkUrl(
       return null;
     }
 
-    return json.url;
+    return withExternalBrowser(json.url);
   } catch (err) {
     console.error('[adminMagicLink] request threw', err);
     return null;

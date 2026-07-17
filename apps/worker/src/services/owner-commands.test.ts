@@ -36,12 +36,16 @@ describe('isOwnerLineUserId', () => {
 });
 
 describe('matchOwnerCommand', () => {
-  test('returns the admin URL for an exact "管理画面" match', () => {
-    expect(matchOwnerCommand('管理画面')).toBe('https://satoyama-ai-base.vercel.app/admin');
+  test('returns the admin URL (with openExternalBrowser=1) for an exact "管理画面" match', () => {
+    expect(matchOwnerCommand('管理画面')).toBe(
+      'https://satoyama-ai-base.vercel.app/admin?openExternalBrowser=1',
+    );
   });
 
   test('tolerates surrounding whitespace', () => {
-    expect(matchOwnerCommand('  管理画面  ')).toBe('https://satoyama-ai-base.vercel.app/admin');
+    expect(matchOwnerCommand('  管理画面  ')).toBe(
+      'https://satoyama-ai-base.vercel.app/admin?openExternalBrowser=1',
+    );
   });
 
   test('returns null for unknown text (falls through to normal handling)', () => {
@@ -75,7 +79,7 @@ describe('resolveOwnerCommandReply', () => {
     vi.unstubAllGlobals();
   });
 
-  test('「管理画面」は発行APIを叩き、成功時はワンタイムURLを返す（固定URLではない）', async () => {
+  test('「管理画面」は発行APIを叩き、成功時はopenExternalBrowser=1付きのワンタイムURLを返す（固定URLではない）', async () => {
     vi.mocked(fetch).mockResolvedValue(
       mockFetchResponse({ json: async () => ({ url: 'https://example.vercel.app/admin-login?token=xyz' }) }),
     );
@@ -85,7 +89,7 @@ describe('resolveOwnerCommandReply', () => {
       backendSecret: 'shared-secret',
     });
 
-    expect(reply).toBe('https://example.vercel.app/admin-login?token=xyz');
+    expect(reply).toBe('https://example.vercel.app/admin-login?token=xyz&openExternalBrowser=1');
     expect(fetch).toHaveBeenCalledTimes(1);
   });
 
@@ -107,7 +111,7 @@ describe('resolveOwnerCommandReply', () => {
     );
 
     const reply = await resolveOwnerCommandReply('  管理画面  ', { backendUrl: 'https://example.vercel.app', backendSecret: 's' });
-    expect(reply).toBe('https://example.vercel.app/admin-login?token=xyz');
+    expect(reply).toBe('https://example.vercel.app/admin-login?token=xyz&openExternalBrowser=1');
   });
 
   test('管理画面以外の未知の文言はnull（発行APIを叩かない）', async () => {

@@ -42,7 +42,7 @@ describe('requestAdminMagicLinkUrl', () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 
-  test('POST /api/admin/magic-link をBearer認証で叩き、urlを返す', async () => {
+  test('POST /api/admin/magic-link をBearer認証で叩き、openExternalBrowser=1付きでurlを返す', async () => {
     vi.mocked(fetch).mockResolvedValue(
       mockFetchResponse({ json: async () => ({ url: 'https://example.vercel.app/admin-login?token=abc123' }) }),
     );
@@ -52,7 +52,9 @@ describe('requestAdminMagicLinkUrl', () => {
       backendSecret: 'shared-secret',
     });
 
-    expect(result).toBe('https://example.vercel.app/admin-login?token=abc123');
+    // LINE内蔵WebViewで管理画面SPAがホワイトアウトする既知の制約があるため、
+    // magic link URLにも常に openExternalBrowser=1 を付与する（外部ブラウザで開かせる）。
+    expect(result).toBe('https://example.vercel.app/admin-login?token=abc123&openExternalBrowser=1');
 
     const [url, init] = vi.mocked(fetch).mock.calls[0];
     expect(String(url)).toBe('https://example.vercel.app/api/admin/magic-link');
@@ -113,13 +115,13 @@ describe('buildAdminDashboardReply', () => {
     vi.unstubAllGlobals();
   });
 
-  test('発行成功時はワンタイムURLをそのまま返す', async () => {
+  test('発行成功時はopenExternalBrowser=1付きのワンタイムURLを返す', async () => {
     vi.mocked(fetch).mockResolvedValue(
       mockFetchResponse({ json: async () => ({ url: 'https://example.vercel.app/admin-login?token=abc123' }) }),
     );
 
     const reply = await buildAdminDashboardReply({ backendUrl: 'https://example.vercel.app', backendSecret: 's' });
-    expect(reply).toBe('https://example.vercel.app/admin-login?token=abc123');
+    expect(reply).toBe('https://example.vercel.app/admin-login?token=abc123&openExternalBrowser=1');
   });
 
   test('発行失敗時は固定URL＋外部ブラウザ案内にフォールバックする', async () => {
