@@ -69,8 +69,13 @@ vi.mock('../services/chatBackend.js', () => ({
   fetchBookingSlots: vi.fn(),
   submitBooking: vi.fn(),
   formatSlotLabel: vi.fn((iso: string) => `label(${iso})`),
+  formatDayLabel: vi.fn((dateKey: string) => `day(${dateKey})`),
   buildSlotPickerFlexContents: vi.fn().mockReturnValue({ type: 'bubble' }),
+  buildDayPickerFlexContents: vi.fn().mockReturnValue({ type: 'bubble', variant: 'day' }),
   parseSlotPostbackData: vi.fn().mockReturnValue(null),
+  parseDayPostbackData: vi.fn().mockReturnValue(null),
+  groupSlotsByJstDay: vi.fn().mockReturnValue([]),
+  filterSlotsByJstDay: vi.fn().mockReturnValue([]),
 }));
 
 import { verifySignature } from '@line-crm/line-sdk';
@@ -107,6 +112,9 @@ import {
   fetchBookingSlots,
   submitBooking,
   parseSlotPostbackData,
+  parseDayPostbackData,
+  groupSlotsByJstDay,
+  filterSlotsByJstDay,
 } from '../services/chatBackend.js';
 import { webhook } from './webhook.js';
 
@@ -140,6 +148,9 @@ beforeEach(() => {
   vi.mocked(clearChatBookingSession).mockResolvedValue(undefined);
   vi.mocked(isChatParityEnabled).mockReturnValue(false);
   vi.mocked(parseSlotPostbackData).mockReturnValue(null);
+  vi.mocked(parseDayPostbackData).mockReturnValue(null);
+  vi.mocked(groupSlotsByJstDay).mockReturnValue([]);
+  vi.mocked(filterSlotsByJstDay).mockReturnValue([]);
 });
 
 describe('POST /webhook — DoS defenses (#104)', () => {
@@ -701,13 +712,20 @@ describe('POST /webhook — chat parity (external chat backend, Ryo限定テス�
     expect(fetchBookingSlots).not.toHaveBeenCalled();
   });
 
-  test('gate open + backend success + book=true + slots available: sends reply text + slot picker flex, and opens a booking session', async () => {
+  test('gate open + backend success + book=true + slots available: sends reply text + day picker flex, and opens a booking session', async () => {
     vi.mocked(isChatParityEnabled).mockReturnValue(true);
     vi.mocked(invokeChatBackend).mockResolvedValue({ reply: '空いている日時をお伝えしますね', book: true, escalate: false });
     vi.mocked(fetchBookingSlots).mockResolvedValue({
       ok: true,
       slots: [{ start: '2026-08-01T01:00:00.000Z', end: '2026-08-01T01:30:00.000Z' }],
     });
+    vi.mocked(groupSlotsByJstDay).mockReturnValue([
+      {
+        dateKey: '2026-08-01',
+        label: '8/1(土)',
+        slots: [{ start: '2026-08-01T01:00:00.000Z', end: '2026-08-01T01:30:00.000Z' }],
+      },
+    ]);
     vi.mocked(buildMessage).mockImplementation((type) =>
       type === 'flex' ? { type: 'flex', altText: 'x', contents: {} } : { type: 'text', text: '空いている日時をお伝えしますね' },
     );
@@ -963,6 +981,13 @@ describe('POST /webhook — chat booking flow (会話中のセッション)', ()
       ok: true,
       slots: [{ start: '2026-08-02T01:00:00.000Z', end: '2026-08-02T01:30:00.000Z' }],
     });
+    vi.mocked(groupSlotsByJstDay).mockReturnValue([
+      {
+        dateKey: '2026-08-02',
+        label: '8/2(日)',
+        slots: [{ start: '2026-08-02T01:00:00.000Z', end: '2026-08-02T01:30:00.000Z' }],
+      },
+    ]);
 
     await postBookingStep('なし');
 
@@ -1153,6 +1178,183 @@ describe('POST /webhook — chat booking slot selection (postback)', () => {
       selectedStart: '2026-08-02T01:00:00.000Z',
       selectedEnd: '2026-08-02T01:30:00.000Z',
     });
+  });
+});
+
+describe('POST /webhook — chat booking day selection (postback)', () => {
+  const dayFriend = {
+    id: 'friend-day-1',
+    line_user_id: 'U-day-1',
+    display_name: 'Day Select Friend',
+    picture_url: null,
+    status_message: null,
+    is_following: 1,
+    user_id: null,
+    line_account_id: null,
+    metadata: '{}',
+    first_tracked_link_id: null,
+    created_at: '2026-07-01T00:00:00.000+09:00',
+    updated_at: '2026-07-01T00:00:00.000+09:00',
+  };
+
+  function makeStmt() {
+    const stmt = {
+      bind: vi.fn(),
+      run: vi.fn().mockResolvedValue({}),
+      all: vi.fn().mockResolvedValue({ results: [] }),
+    };
+    stmt.bind.mockReturnValue(stmt);
+    return stmt;
+  }
+
+  function makePostbackEvent(data: string, replyToken: string) {
+    return {
+      type: 'postback',
+      replyToken,
+      postback: { data },
+      timestamp: Date.now(),
+      source: { type: 'user', userId: 'U-day-1' },
+      webhookEventId: 'event-day-1',
+      deliveryContext: { isRedelivery: false },
+      mode: 'active',
+    };
+  }
+
+  async function postDaySelection(data: string, envOverrides: Record<string, unknown> = {}) {
+    const replyToken = 'reply-token-day';
+    const stmt = makeStmt();
+    const db = { prepare: vi.fn().mockReturnValue(stmt) } as unknown as D1Database;
+    const executionCtx = {
+      waitUntil: vi.fn(),
+      passThroughOnException: vi.fn(),
+      props: {},
+    } as unknown as ExecutionContext;
+
+    const app = setupApp();
+    const validShapedSignature = 'A'.repeat(43) + '=';
+    const res = await app.request(
+      '/webhook',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Line-Signature': validShapedSignature },
+        body: JSON.stringify({ destination: 'bot', events: [makePostbackEvent(data, replyToken)] }),
+      },
+      {
+        ...baseEnv,
+        DB: db,
+        CHAT_BACKEND_URL: 'https://backend.example',
+        CHAT_BACKEND_SECRET: 'secret',
+        ...envOverrides,
+      },
+      executionCtx,
+    );
+
+    const processing = vi.mocked(executionCtx.waitUntil).mock.calls[0]?.[0] as Promise<unknown>;
+    await processing;
+
+    return { res, db, stmt, replyToken };
+  }
+
+  beforeEach(() => {
+    vi.mocked(verifySignature).mockResolvedValue(true);
+    vi.mocked(getFriendByLineUserId).mockResolvedValue(
+      dayFriend as unknown as Awaited<ReturnType<typeof getFriendByLineUserId>>,
+    );
+    vi.mocked(jstNow).mockReturnValue('2026-07-01T12:00:00.000+09:00');
+    vi.mocked(buildMessage).mockImplementation((type, content) => ({ type, text: content } as never));
+    vi.mocked(messageToLogPayload).mockReturnValue({ messageType: 'text', content: 'x' });
+  });
+
+  test('unrelated postback data (parseDayPostbackData → null) does not touch day-selection handling', async () => {
+    vi.mocked(parseDayPostbackData).mockReturnValue(null);
+    vi.mocked(parseSlotPostbackData).mockReturnValue(null);
+
+    const { res } = await postDaySelection('コスト比較');
+
+    expect(res.status).toBe(200);
+    expect(fetchBookingSlots).not.toHaveBeenCalled();
+  });
+
+  test('day postback with slots available for that day: shows the time picker for that day and keeps awaiting_slot_selection', async () => {
+    vi.mocked(parseDayPostbackData).mockReturnValue('2026-08-01');
+    vi.mocked(fetchBookingSlots).mockResolvedValue({
+      ok: true,
+      slots: [
+        { start: '2026-08-01T01:00:00.000Z', end: '2026-08-01T01:30:00.000Z' },
+        { start: '2026-08-02T01:00:00.000Z', end: '2026-08-02T01:30:00.000Z' },
+      ],
+    });
+    vi.mocked(filterSlotsByJstDay).mockReturnValue([
+      { start: '2026-08-01T01:00:00.000Z', end: '2026-08-01T01:30:00.000Z' },
+    ]);
+
+    const { res, replyToken } = await postDaySelection('CHATBOOK_DAY:2026-08-01');
+
+    expect(res.status).toBe(200);
+    expect(fetchBookingSlots).toHaveBeenCalledWith({ backendUrl: 'https://backend.example', backendSecret: 'secret' });
+    expect(filterSlotsByJstDay).toHaveBeenCalledWith(
+      [
+        { start: '2026-08-01T01:00:00.000Z', end: '2026-08-01T01:30:00.000Z' },
+        { start: '2026-08-02T01:00:00.000Z', end: '2026-08-02T01:30:00.000Z' },
+      ],
+      '2026-08-01',
+    );
+    expect(upsertChatBookingSession).toHaveBeenCalledWith(expect.anything(), 'friend-day-1', {
+      state: 'awaiting_slot_selection',
+    });
+    expect(lineClientMocks.replyMessage).toHaveBeenCalledWith(replyToken, [expect.objectContaining({ type: 'flex' })]);
+  });
+
+  test('day postback but that day is now fully booked (race): falls back to a fresh day picker', async () => {
+    vi.mocked(parseDayPostbackData).mockReturnValue('2026-08-01');
+    vi.mocked(fetchBookingSlots).mockResolvedValue({
+      ok: true,
+      slots: [{ start: '2026-08-02T01:00:00.000Z', end: '2026-08-02T01:30:00.000Z' }],
+    });
+    vi.mocked(filterSlotsByJstDay).mockReturnValue([]);
+    vi.mocked(groupSlotsByJstDay).mockReturnValue([
+      {
+        dateKey: '2026-08-02',
+        label: '8/2(日)',
+        slots: [{ start: '2026-08-02T01:00:00.000Z', end: '2026-08-02T01:30:00.000Z' }],
+      },
+    ]);
+
+    const { res, replyToken } = await postDaySelection('CHATBOOK_DAY:2026-08-01');
+
+    expect(res.status).toBe(200);
+    expect(upsertChatBookingSession).toHaveBeenCalledWith(expect.anything(), 'friend-day-1', {
+      state: 'awaiting_slot_selection',
+    });
+    expect(lineClientMocks.replyMessage).toHaveBeenCalledWith(replyToken, [
+      expect.objectContaining({ type: 'text' }),
+      expect.objectContaining({ type: 'flex' }),
+    ]);
+    expect(clearChatBookingSession).not.toHaveBeenCalled();
+  });
+
+  test('day postback but slots fetch fails entirely: clears the session and asks to restart', async () => {
+    vi.mocked(parseDayPostbackData).mockReturnValue('2026-08-01');
+    vi.mocked(fetchBookingSlots).mockResolvedValue({ ok: false, reason: 'fetch_failed' });
+
+    const { res, replyToken } = await postDaySelection('CHATBOOK_DAY:2026-08-01');
+
+    expect(res.status).toBe(200);
+    expect(clearChatBookingSession).toHaveBeenCalledWith(expect.anything(), 'friend-day-1');
+    expect(lineClientMocks.replyMessage).toHaveBeenCalledWith(replyToken, [expect.objectContaining({ type: 'text' })]);
+  });
+
+  test('day postback but backend not configured: tells the user booking is temporarily unavailable', async () => {
+    vi.mocked(parseDayPostbackData).mockReturnValue('2026-08-01');
+
+    const { res, replyToken } = await postDaySelection('CHATBOOK_DAY:2026-08-01', {
+      CHAT_BACKEND_URL: undefined,
+      CHAT_BACKEND_SECRET: undefined,
+    });
+
+    expect(res.status).toBe(200);
+    expect(fetchBookingSlots).not.toHaveBeenCalled();
+    expect(lineClientMocks.replyMessage).toHaveBeenCalledWith(replyToken, [expect.objectContaining({ type: 'text' })]);
   });
 });
 

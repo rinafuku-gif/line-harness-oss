@@ -5,9 +5,16 @@ import {
   fetchBookingSlots,
   submitBooking,
   formatSlotLabel,
+  formatDayLabel,
+  toJstDateKey,
   buildSlotPostbackData,
   parseSlotPostbackData,
   buildSlotPickerFlexContents,
+  groupSlotsByJstDay,
+  filterSlotsByJstDay,
+  buildDayPostbackData,
+  parseDayPostbackData,
+  buildDayPickerFlexContents,
 } from './chatBackend.js';
 
 function mockFetchResponse(overrides: {
@@ -277,17 +284,21 @@ describe('slot postback data round-trip', () => {
 });
 
 describe('buildSlotPickerFlexContents', () => {
-  test('caps the number of buttons at 5 even when more slots are given', () => {
-    const slots = Array.from({ length: 8 }, (_, i) => ({
-      start: `2026-08-0${(i % 9) + 1}T01:00:00.000Z`,
-      end: `2026-08-0${(i % 9) + 1}T01:30:00.000Z`,
+  // 2026-07-17: 従来は先頭5件で機械的に切っていたため「今日残り5枠」があると
+  // それ以降の日が一切表示されないバグがあった。呼び出し元(webhook.ts)が
+  // groupSlotsByJstDay で1日分ずつに絞ってから渡す設計になったため、この関数自体の
+  // 上限は「1日の理論上の最大枠数」である14件まで緩和されている。
+  test('caps the number of buttons at 14 (1日の理論上の最大枠数) even when more slots are given', () => {
+    const slots = Array.from({ length: 20 }, (_, i) => ({
+      start: `2026-08-01T${String(1 + i).padStart(2, '0')}:00:00.000Z`,
+      end: `2026-08-01T${String(1 + i).padStart(2, '0')}:30:00.000Z`,
     }));
 
     const bubble = buildSlotPickerFlexContents(slots) as {
       body: { contents: unknown[] };
     };
 
-    expect(bubble.body.contents).toHaveLength(5);
+    expect(bubble.body.contents).toHaveLength(14);
   });
 
   test('each button postback data matches the offered slot', () => {
@@ -300,5 +311,155 @@ describe('buildSlotPickerFlexContents', () => {
       'CHATBOOK_SLOT:2026-08-01T01:00:00.000Z|2026-08-01T01:30:00.000Z',
     );
     expect(bubble.body.contents[0].action.label).toBe('8/1(土) 10:00');
+  });
+
+  test('without a dateLabel, uses the generic header (backward compatible)', () => {
+    const slots = [{ start: '2026-08-01T01:00:00.000Z', end: '2026-08-01T01:30:00.000Z' }];
+    const bubble = buildSlotPickerFlexContents(slots) as {
+      header: { contents: Array<{ text: string }> };
+    };
+    expect(bubble.header.contents[0].text).toBe('空いている日時');
+  });
+
+  test('with a dateLabel, the header explicitly names the day', () => {
+    const slots = [{ start: '2026-08-01T01:00:00.000Z', end: '2026-08-01T01:30:00.000Z' }];
+    const bubble = buildSlotPickerFlexContents(slots, '8/1(土)') as {
+      header: { contents: Array<{ text: string }> };
+    };
+    expect(bubble.header.contents[0].text).toBe('8/1(土)の空いている時間');
+  });
+});
+
+describe('toJstDateKey', () => {
+  test('extracts the JST date key (YYYY-MM-DD) from a UTC ISO string', () => {
+    // 2026-08-01T01:00:00.000Z = 2026-08-01 10:00 JST
+    expect(toJstDateKey('2026-08-01T01:00:00.000Z')).toBe('2026-08-01');
+  });
+
+  test('rolls over to the next JST day when UTC time crosses midnight JST', () => {
+    // 2026-07-31T15:30:00.000Z = 2026-08-01 00:30 JST
+    expect(toJstDateKey('2026-07-31T15:30:00.000Z')).toBe('2026-08-01');
+  });
+});
+
+describe('formatDayLabel', () => {
+  test('formats a JST date key as "M/D(曜)"', () => {
+    expect(formatDayLabel('2026-08-01')).toBe('8/1(土)');
+  });
+});
+
+describe('groupSlotsByJstDay', () => {
+  test('groups a flat, time-ordered slot list into per-day buckets, preserving date order', () => {
+    const slots = [
+      { start: '2026-08-01T01:00:00.000Z', end: '2026-08-01T01:30:00.000Z' }, // 8/1 10:00 JST
+      { start: '2026-08-01T02:00:00.000Z', end: '2026-08-01T02:30:00.000Z' }, // 8/1 11:00 JST
+      { start: '2026-08-02T01:00:00.000Z', end: '2026-08-02T01:30:00.000Z' }, // 8/2 10:00 JST
+    ];
+
+    const groups = groupSlotsByJstDay(slots);
+
+    expect(groups).toEqual([
+      { dateKey: '2026-08-01', label: '8/1(土)', slots: [slots[0], slots[1]] },
+      { dateKey: '2026-08-02', label: '8/2(日)', slots: [slots[2]] },
+    ]);
+  });
+
+  // 回帰テスト: 旧バグ再現ケース。「当日に5枠以上残っている」状況でも、翌日以降の日が
+  // 消えずにグルーピングされることを確認する（buildSlotPickerFlexContentsの固定5件
+  // キャップと違い、グルーピング自体は全日程を保持する）。
+  test('does not drop later days even when the first day alone has more than the old 5-slot cap', () => {
+    const day1Slots = Array.from({ length: 6 }, (_, i) => ({
+      start: `2026-08-01T0${i}:00:00.000Z`,
+      end: `2026-08-01T0${i}:30:00.000Z`,
+    }));
+    const day2Slot = { start: '2026-08-02T01:00:00.000Z', end: '2026-08-02T01:30:00.000Z' };
+
+    const groups = groupSlotsByJstDay([...day1Slots, day2Slot]);
+
+    expect(groups).toHaveLength(2);
+    expect(groups[0].dateKey).toBe('2026-08-01');
+    expect(groups[0].slots).toHaveLength(6);
+    expect(groups[1].dateKey).toBe('2026-08-02');
+    expect(groups[1].slots).toHaveLength(1);
+  });
+
+  test('caps the number of day groups at 10', () => {
+    const slots = Array.from({ length: 14 }, (_, i) => ({
+      start: `2026-08-${String(i + 1).padStart(2, '0')}T01:00:00.000Z`,
+      end: `2026-08-${String(i + 1).padStart(2, '0')}T01:30:00.000Z`,
+    }));
+
+    const groups = groupSlotsByJstDay(slots);
+
+    expect(groups).toHaveLength(10);
+  });
+
+  test('returns an empty array for an empty slot list', () => {
+    expect(groupSlotsByJstDay([])).toEqual([]);
+  });
+});
+
+describe('filterSlotsByJstDay', () => {
+  test('returns only the slots that fall on the given JST date key', () => {
+    const slots = [
+      { start: '2026-08-01T01:00:00.000Z', end: '2026-08-01T01:30:00.000Z' },
+      { start: '2026-08-02T01:00:00.000Z', end: '2026-08-02T01:30:00.000Z' },
+      { start: '2026-08-01T02:00:00.000Z', end: '2026-08-01T02:30:00.000Z' },
+    ];
+
+    expect(filterSlotsByJstDay(slots, '2026-08-01')).toEqual([slots[0], slots[2]]);
+  });
+
+  test('returns an empty array when no slot matches the date key', () => {
+    const slots = [{ start: '2026-08-01T01:00:00.000Z', end: '2026-08-01T01:30:00.000Z' }];
+    expect(filterSlotsByJstDay(slots, '2026-09-01')).toEqual([]);
+  });
+});
+
+describe('day postback data round-trip', () => {
+  test('buildDayPostbackData / parseDayPostbackData round-trip correctly', () => {
+    const data = buildDayPostbackData('2026-08-01');
+    expect(data).toBe('CHATBOOK_DAY:2026-08-01');
+    expect(parseDayPostbackData(data)).toBe('2026-08-01');
+  });
+
+  test('parseDayPostbackData returns null for unrelated postback data (auto_replies / slot postback等)', () => {
+    expect(parseDayPostbackData('コスト比較')).toBeNull();
+    expect(parseDayPostbackData('')).toBeNull();
+    expect(parseDayPostbackData('CHATBOOK_SLOT:2026-08-01T01:00:00.000Z|2026-08-01T01:30:00.000Z')).toBeNull();
+  });
+
+  test('parseDayPostbackData returns null for an empty date key', () => {
+    expect(parseDayPostbackData('CHATBOOK_DAY:')).toBeNull();
+  });
+});
+
+describe('buildDayPickerFlexContents', () => {
+  test('renders one button per day group, labeled with the slot count', () => {
+    const days = [
+      {
+        dateKey: '2026-08-01',
+        label: '8/1(土)',
+        slots: [
+          { start: '2026-08-01T01:00:00.000Z', end: '2026-08-01T01:30:00.000Z' },
+          { start: '2026-08-01T02:00:00.000Z', end: '2026-08-01T02:30:00.000Z' },
+        ],
+      },
+      {
+        dateKey: '2026-08-02',
+        label: '8/2(日)',
+        slots: [{ start: '2026-08-02T01:00:00.000Z', end: '2026-08-02T01:30:00.000Z' }],
+      },
+    ];
+
+    const bubble = buildDayPickerFlexContents(days) as {
+      body: { contents: Array<{ action: { data: string; label: string } }> };
+    };
+
+    expect(bubble.body.contents).toHaveLength(2);
+    expect(bubble.body.contents[0].action.data).toBe('CHATBOOK_DAY:2026-08-01');
+    expect(bubble.body.contents[0].action.label).toBe('8/1(土)・2枠');
+    expect(bubble.body.contents[1].action.data).toBe('CHATBOOK_DAY:2026-08-02');
+    expect(bubble.body.contents[1].action.label).toBe('8/2(日)・1枠');
   });
 });

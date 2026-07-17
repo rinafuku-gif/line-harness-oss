@@ -33,8 +33,13 @@ import {
   fetchBookingSlots,
   submitBooking,
   formatSlotLabel,
+  formatDayLabel,
   buildSlotPickerFlexContents,
+  buildDayPickerFlexContents,
   parseSlotPostbackData,
+  parseDayPostbackData,
+  groupSlotsByJstDay,
+  filterSlotsByJstDay,
   type BookingSlot,
 } from '../services/chatBackend.js';
 import {
@@ -182,6 +187,81 @@ async function handleChatBookingSlotSelection(
   await sendReplyAndLog(lineClient, db, friend.id, replyToken, [msg], 'chat_booking_flow');
 }
 
+/**
+ * 「①日にちを選ぶ→②その日の時間を選ぶ」の1段目（CHATBOOK_DAY: postback）を処理する。
+ * 空き枠取得APIは常に14日分のフラット配列を返す契約のため、ここで毎回
+ * fetchBookingSlots() を呼び直してから filterSlotsByJstDay() で該当日だけに絞り込む
+ * （日付選択の間に他の人が予約して枠が減っている可能性があるため、キャッシュせず
+ * 都度取得するのが安全側）。
+ */
+async function handleChatBookingDaySelection(
+  db: D1Database,
+  lineClient: LineClient,
+  replyToken: string,
+  friend: Friend,
+  dateKey: string,
+  chatEnv: Pick<ChatBackendEnv, 'backendUrl' | 'backendSecret'>,
+): Promise<void> {
+  if (!chatEnv.backendUrl || !chatEnv.backendSecret) {
+    const msg = buildMessage('text', '只今予約処理を行えませんでした。お手数ですが担当者へ直接ご連絡ください。');
+    await sendReplyAndLog(lineClient, db, friend.id, replyToken, [msg], 'chat_booking_flow');
+    return;
+  }
+
+  const slotsResult = await fetchBookingSlots({
+    backendUrl: chatEnv.backendUrl,
+    backendSecret: chatEnv.backendSecret,
+  });
+
+  if (!slotsResult.ok || slotsResult.slots.length === 0) {
+    await clearChatBookingSession(db, friend.id);
+    const msg = buildMessage(
+      'text',
+      'あいにく、ただいま空いている日時がございません。恐れ入りますが、担当者からのご連絡をお待ちください。',
+    );
+    await sendReplyAndLog(lineClient, db, friend.id, replyToken, [msg], 'chat_booking_flow');
+    return;
+  }
+
+  const daySlots = filterSlotsByJstDay(slotsResult.slots, dateKey);
+
+  if (daySlots.length === 0) {
+    // 日付選択ボタンをタップするまでの間に、その日の枠が別の人に埋まってしまった
+    // ケース（レース）。エラーで終わらせず、最新の日付一覧を出して選び直させる。
+    const dayGroups = groupSlotsByJstDay(slotsResult.slots);
+    if (dayGroups.length === 0) {
+      await clearChatBookingSession(db, friend.id);
+      const msg = buildMessage(
+        'text',
+        'あいにく、ただいま空いている日時がございません。恐れ入りますが、担当者からのご連絡をお待ちください。',
+      );
+      await sendReplyAndLog(lineClient, db, friend.id, replyToken, [msg], 'chat_booking_flow');
+      return;
+    }
+    await upsertChatBookingSession(db, friend.id, { state: 'awaiting_slot_selection' });
+    const textMsg = buildMessage(
+      'text',
+      'せっかくお選びいただきましたが、その日はちょうど埋まってしまったようです。改めて空いている日をお送りします。',
+    );
+    const flexMsg = buildMessage(
+      'flex',
+      JSON.stringify(buildDayPickerFlexContents(dayGroups)),
+      'ご希望の日を選択してください',
+    );
+    await sendReplyAndLog(lineClient, db, friend.id, replyToken, [textMsg, flexMsg], 'chat_booking_flow');
+    return;
+  }
+
+  await upsertChatBookingSession(db, friend.id, { state: 'awaiting_slot_selection' });
+  const label = formatDayLabel(dateKey);
+  const flexMsg = buildMessage(
+    'flex',
+    JSON.stringify(buildSlotPickerFlexContents(daySlots, label)),
+    `${label}の空いている時間を選択してください`,
+  );
+  await sendReplyAndLog(lineClient, db, friend.id, replyToken, [flexMsg], 'chat_booking_flow');
+}
+
 const CHAT_BOOKING_RESET_COMMANDS = ['最初から', 'キャンセル'];
 const CHAT_BOOKING_NO_EMAIL_KEYWORDS = ['なし', 'ない', '無し', 'skip', 'スキップ'];
 
@@ -280,7 +360,8 @@ async function handleChatBookingTextStep(
       backendUrl: chatEnv.backendUrl,
       backendSecret: chatEnv.backendSecret,
     });
-    if (slotsResult.ok && slotsResult.slots.length > 0) {
+    const dayGroups = slotsResult.ok ? groupSlotsByJstDay(slotsResult.slots) : [];
+    if (slotsResult.ok && dayGroups.length > 0) {
       await upsertChatBookingSession(db, friend.id, {
         state: 'awaiting_slot_selection',
         selectedStart: null,
@@ -288,12 +369,12 @@ async function handleChatBookingTextStep(
       });
       const textMsg = buildMessage(
         'text',
-        'せっかくお選びいただきましたが、その枠はちょうど埋まってしまったようです。改めて空き枠をお送りします。',
+        'せっかくお選びいただきましたが、その枠はちょうど埋まってしまったようです。改めて空いている日をお送りします。',
       );
       const flexMsg = buildMessage(
         'flex',
-        JSON.stringify(buildSlotPickerFlexContents(slotsResult.slots)),
-        '空いている日時を選択してください',
+        JSON.stringify(buildDayPickerFlexContents(dayGroups)),
+        'ご希望の日を選択してください',
       );
       await sendReplyAndLog(lineClient, db, friend.id, replyToken, [textMsg, flexMsg], 'chat_booking_flow');
     } else {
@@ -681,6 +762,22 @@ async function handleEvent(
       return;
     }
 
+    // チャット駆動予約フロー — 日付選択ボタン（1段目）の postback。その日の時間枠
+    // 一覧（2段目）を返す。同じく auto_replies は通さない。
+    const chatBookingDay = parseDayPostbackData(postbackData);
+    if (chatBookingDay) {
+      try {
+        await handleChatBookingDaySelection(db, lineClient, event.replyToken, friend, chatBookingDay, {
+          backendUrl: chatBackendEnv.backendUrl,
+          backendSecret: chatBackendEnv.backendSecret,
+        });
+      } catch (err) {
+        console.error('[webhook] chat booking day selection failed', err);
+        await clearChatBookingSession(db, friend.id).catch(() => undefined);
+      }
+      return;
+    }
+
     for (const rule of autoReplies.results) {
       const isMatch = rule.match_type === 'exact'
         ? postbackData === rule.keyword
@@ -1027,12 +1124,13 @@ async function handleEvent(
               backendUrl: chatBackendEnv.backendUrl,
               backendSecret: chatBackendEnv.backendSecret,
             });
-            if (slotsResult.ok && slotsResult.slots.length > 0) {
+            const dayGroups = slotsResult.ok ? groupSlotsByJstDay(slotsResult.slots) : [];
+            if (slotsResult.ok && dayGroups.length > 0) {
               messagesToSend.push(
                 buildMessage(
                   'flex',
-                  JSON.stringify(buildSlotPickerFlexContents(slotsResult.slots)),
-                  '空いている日時を選択してください',
+                  JSON.stringify(buildDayPickerFlexContents(dayGroups)),
+                  'ご希望の日を選択してください',
                 ),
               );
               await upsertChatBookingSession(db, friend.id, { state: 'awaiting_slot_selection' });

@@ -219,9 +219,28 @@ export function parseSlotPostbackData(data: string): BookingSlot | null {
   return { start, end };
 }
 
-/** 空き枠一覧（最大5件）を選択ボタン付き Flex bubble の JSON として組み立てる。 */
-export function buildSlotPickerFlexContents(slots: BookingSlot[]): object {
-  const limited = slots.slice(0, 5);
+/**
+ * 1日あたりの営業時間帯（10:00-17:00・30分刻み）で理論上とりうる枠数の上限。
+ * satoyama-ai-base 側 server/booking/slots.ts の BUSINESS_START_HOUR(10) /
+ * BUSINESS_END_HOUR(17) / SLOT_MINUTES(30) と同じ前提（(17-10)*60/30 = 14）。
+ * 1日分の枠を丸ごと見せる時のボタン数上限として使う（従来の固定5件キャップの撤去）。
+ */
+const MAX_SLOTS_PER_DAY_DISPLAY = 14;
+
+/** 空き枠一覧（最大 {@link MAX_SLOTS_PER_DAY_DISPLAY} 件）を選択ボタン付き Flex bubble の JSON として組み立てる。
+ *
+ * 2026-07-17修正: 従来は呼び出し元が渡した空き枠配列（14日分の時系列フラットリスト）の
+ * 先頭5件を機械的に切り出していたため、「今日残り5枠」がたまたま5件あると、
+ * それ以降の全ての日が一切表示されないバグがあった（Ryo実機報告）。この関数自体は
+ * 「渡された枠をボタンにする」責務のみ残し、呼び出し元（webhook.ts）が
+ * {@link groupSlotsByJstDay} で日ごとにグルーピングしてから、1日分ずつ渡す設計に変更した。
+ *
+ * @param dateLabel 指定時、ヘッダーに「7/22(水)の空いている時間」のように日付を明示する。
+ *   省略時は従来通り汎用の「空いている日時」ヘッダーになる（後方互換）。
+ */
+export function buildSlotPickerFlexContents(slots: BookingSlot[], dateLabel?: string): object {
+  const limited = slots.slice(0, MAX_SLOTS_PER_DAY_DISPLAY);
+  const headerText = dateLabel ? `${dateLabel}の空いている時間` : '空いている日時';
   return {
     type: 'bubble',
     header: {
@@ -229,7 +248,7 @@ export function buildSlotPickerFlexContents(slots: BookingSlot[]): object {
       layout: 'vertical',
       paddingAll: '20px',
       backgroundColor: '#f5f2eb',
-      contents: [{ type: 'text', text: '空いている日時', size: 'md', weight: 'bold', color: '#1a1a1a' }],
+      contents: [{ type: 'text', text: headerText, size: 'md', weight: 'bold', color: '#1a1a1a', wrap: true }],
     },
     body: {
       type: 'box',
@@ -253,7 +272,123 @@ export function buildSlotPickerFlexContents(slots: BookingSlot[]): object {
       layout: 'vertical',
       paddingAll: '12px',
       contents: [
-        { type: 'text', text: 'ご希望の日時をタップしてください', size: 'xs', color: '#64748b', wrap: true },
+        { type: 'text', text: 'ご希望の時間をタップしてください', size: 'xs', color: '#64748b', wrap: true },
+      ],
+    },
+  };
+}
+
+// ─── 日付ごとのグルーピング（日→時間の2段選択フロー） ────────────────────
+//
+// 2026-07-17追加。GET /api/line/booking/slots は14日分の枠をすべて時系列フラットな
+// 配列で返す（satoyama-ai-base server/booking/index.ts のgetAvailableSlots）。
+// これをJST日付単位でグルーピングし、「①日にちを選ぶ→②その日の時間を選ぶ」の
+// 2段フローに使う。空き枠取得APIの契約（docs/line-booking-integration.md §3.1）は
+// 変更していない — グルーピングはHarness側（この関数）だけで完結する。
+
+const WEEKDAYS_JA_DAY = WEEKDAYS_JA;
+
+/** UTC ISO8601 文字列から JST の日付キー（YYYY-MM-DD）を取り出す。 */
+export function toJstDateKey(isoUtc: string): string {
+  const jst = new Date(new Date(isoUtc).getTime() + 9 * 60 * 60 * 1000);
+  const year = jst.getUTCFullYear();
+  const month = String(jst.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(jst.getUTCDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+/** JST日付キー（YYYY-MM-DD）を「7/22(水)」形式のラベルに変換する。 */
+export function formatDayLabel(dateKey: string): string {
+  const [year, month, day] = dateKey.split('-').map((n) => Number.parseInt(n, 10));
+  // UTC基準でその日付の曜日を計算する（JSTの暦日そのものの曜日なのでタイムゾーン変換は不要）。
+  const weekday = WEEKDAYS_JA_DAY[new Date(Date.UTC(year, month - 1, day)).getUTCDay()];
+  return `${month}/${day}(${weekday})`;
+}
+
+export interface SlotDayGroup {
+  dateKey: string;
+  label: string;
+  slots: BookingSlot[];
+}
+
+/** 1日あたりに表示する日付ボタンの上限（14日先までの営業日を素直に出すと最大10日前後になる想定）。 */
+const MAX_DAY_GROUPS_DISPLAY = 10;
+
+/**
+ * 空き枠のフラット配列をJST日付ごとにグルーピングする。入力は
+ * fetchBookingSlots() が返す時系列順の配列を想定しており、出力もその順序
+ * （＝日付の早い順）を保つ。表示件数の上限は {@link MAX_DAY_GROUPS_DISPLAY}。
+ */
+export function groupSlotsByJstDay(slots: BookingSlot[]): SlotDayGroup[] {
+  const groups: SlotDayGroup[] = [];
+  const indexByDateKey = new Map<string, number>();
+
+  for (const slot of slots) {
+    const dateKey = toJstDateKey(slot.start);
+    const existingIndex = indexByDateKey.get(dateKey);
+    if (existingIndex === undefined) {
+      indexByDateKey.set(dateKey, groups.length);
+      groups.push({ dateKey, label: formatDayLabel(dateKey), slots: [slot] });
+    } else {
+      groups[existingIndex].slots.push(slot);
+    }
+  }
+
+  return groups.slice(0, MAX_DAY_GROUPS_DISPLAY);
+}
+
+/** 空き枠のフラット配列から、指定したJST日付キーに属するものだけを抽出する（日→時間の2段目で使う）。 */
+export function filterSlotsByJstDay(slots: BookingSlot[], dateKey: string): BookingSlot[] {
+  return slots.filter((slot) => toJstDateKey(slot.start) === dateKey);
+}
+
+/** 日付選択用の postback data のプレフィックス（webhook.ts のハンドラと共有）。 */
+export const CHATBOOK_DAY_PREFIX = 'CHATBOOK_DAY:';
+
+export function buildDayPostbackData(dateKey: string): string {
+  return `${CHATBOOK_DAY_PREFIX}${dateKey}`;
+}
+
+export function parseDayPostbackData(data: string): string | null {
+  if (!data.startsWith(CHATBOOK_DAY_PREFIX)) return null;
+  const dateKey = data.slice(CHATBOOK_DAY_PREFIX.length);
+  return dateKey || null;
+}
+
+/** 日付一覧を選択ボタン付き Flex bubble の JSON として組み立てる（時間選択の前段）。 */
+export function buildDayPickerFlexContents(days: SlotDayGroup[]): object {
+  return {
+    type: 'bubble',
+    header: {
+      type: 'box',
+      layout: 'vertical',
+      paddingAll: '20px',
+      backgroundColor: '#f5f2eb',
+      contents: [{ type: 'text', text: 'ご希望の日を選んでください', size: 'md', weight: 'bold', color: '#1a1a1a', wrap: true }],
+    },
+    body: {
+      type: 'box',
+      layout: 'vertical',
+      spacing: 'sm',
+      paddingAll: '16px',
+      contents: days.map((day) => ({
+        type: 'button',
+        style: 'secondary',
+        height: 'sm',
+        action: {
+          type: 'postback',
+          label: `${day.label}・${day.slots.length}枠`,
+          data: buildDayPostbackData(day.dateKey),
+          displayText: `${day.label} を選びました`,
+        },
+      })),
+    },
+    footer: {
+      type: 'box',
+      layout: 'vertical',
+      paddingAll: '12px',
+      contents: [
+        { type: 'text', text: 'タップすると、その日の空いている時間を表示します', size: 'xs', color: '#64748b', wrap: true },
       ],
     },
   };
