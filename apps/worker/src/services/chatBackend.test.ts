@@ -18,6 +18,8 @@ import {
   buildQuickReplyItems,
   QUICK_REPLY_MAX_ITEMS,
   QUICK_REPLY_LABEL_MAX_LENGTH,
+  isExplicitBookingIntent,
+  BOOKING_QUICK_REPLY_LABEL,
 } from './chatBackend.js';
 
 function mockFetchResponse(overrides: {
@@ -57,6 +59,56 @@ describe('isChatParityEnabled', () => {
 
   test('parityEnabled values other than "all" do not enable the flow by themselves', () => {
     expect(isChatParityEnabled('U123', { parityEnabled: 'true' })).toBe(false);
+  });
+});
+
+describe('isExplicitBookingIntent', () => {
+  // 2026-07-17 実機バグ再現テスト: 単なる相談の切り出し（「〜について相談したいです」）が
+  // 明示的な予約意図と誤判定され、AIを介さず日付ピッカーFlexへ直行してしまっていた。
+  test('a plain first-time consultation opener containing "相談したい" is NOT explicit booking intent (regression: 実機バグ)', () => {
+    expect(isExplicitBookingIntent('AIの導入について相談したいです')).toBe(false);
+  });
+
+  test('"話したい" alone is NOT explicit booking intent (AIのソフトな例外判断に委ねる。ハードゲートでは扱わない)', () => {
+    expect(isExplicitBookingIntent('担当者と話したいです')).toBe(false);
+  });
+
+  test('"電話したい" alone is NOT explicit booking intent', () => {
+    expect(isExplicitBookingIntent('電話したいのですが')).toBe(false);
+  });
+
+  test('"話を聞きたい" alone is NOT explicit booking intent', () => {
+    expect(isExplicitBookingIntent('もう少し話を聞きたいです')).toBe(false);
+  });
+
+  test('business-context "予約" mentions (not a first-person booking action) are NOT explicit booking intent', () => {
+    expect(isExplicitBookingIntent('予約管理を自動化したい')).toBe(false);
+    expect(isExplicitBookingIntent('予約システムについて教えてください')).toBe(false);
+  });
+
+  test('empty / whitespace-only text is NOT explicit booking intent', () => {
+    expect(isExplicitBookingIntent('')).toBe(false);
+    expect(isExplicitBookingIntent('   ')).toBe(false);
+  });
+
+  test('an explicit "予約したい" is booking intent', () => {
+    expect(isExplicitBookingIntent('無料相談を予約したい')).toBe(true);
+  });
+
+  test('an explicit "予約する" is booking intent', () => {
+    expect(isExplicitBookingIntent('予約する')).toBe(true);
+  });
+
+  test('an explicit "予約をお願いします" is booking intent', () => {
+    expect(isExplicitBookingIntent('予約をお願いします')).toBe(true);
+  });
+
+  test('tapping the booking quick-reply button (exact label match) is booking intent', () => {
+    expect(isExplicitBookingIntent(BOOKING_QUICK_REPLY_LABEL)).toBe(true);
+  });
+
+  test('the button label with surrounding whitespace still matches (trim before compare)', () => {
+    expect(isExplicitBookingIntent(`  ${BOOKING_QUICK_REPLY_LABEL}  `)).toBe(true);
   });
 });
 

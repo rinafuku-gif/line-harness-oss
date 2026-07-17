@@ -757,6 +757,52 @@ describe('POST /webhook — chat parity (external chat backend, Ryo限定テス�
     ]);
   });
 
+  // 2026-07-17 実機バグ再現テスト（受け入れテスト③）: 「AIの導入について相談したいです」
+  // のような、ただの相談の切り出し文言が isExplicitBookingIntent() に誤って一致し、
+  // AIを一切介さず日付ピッカーFlexへ直行していた（"相談したい"の部分一致が原因）。
+  // 修正後は通常のAI会話ルート（invokeChatBackend）に入り、Flexは出ないことを検証する。
+  test('"AIの導入について相談したいです" (a plain consultation opener) routes to the AI backend, does NOT jump straight to the date-picker Flex — regression: 実機バグ', async () => {
+    vi.mocked(isChatParityEnabled).mockReturnValue(true);
+    vi.mocked(invokeChatBackend).mockResolvedValue({
+      reply: 'かしこまりました。今どんなことに時間を取られていますか？',
+      book: false,
+      escalate: false,
+      quickReplies: ['予約や問い合わせの対応', 'SNSやチラシなどの発信', 'その他'],
+    });
+    vi.mocked(buildMessage).mockReturnValue({
+      type: 'text',
+      text: 'かしこまりました。今どんなことに時間を取られていますか？',
+    });
+    vi.mocked(messageToLogPayload).mockReturnValue({
+      messageType: 'text',
+      content: 'かしこまりました。今どんなことに時間を取られていますか？',
+    });
+
+    const { res, replyToken } = await postParity(
+      {
+        GEMINI_API_KEY: 'test-gemini-key',
+        CHAT_BACKEND_URL: 'https://backend.example',
+        CHAT_BACKEND_SECRET: 'secret',
+        CHAT_PARITY_TEST_USER_IDS: 'U-parity-1',
+      },
+      'AIの導入について相談したいです',
+    );
+
+    expect(res.status).toBe(200);
+    // AIを介す（invokeChatBackendが呼ばれる）。fetchBookingSlots（＝Flex直行）は呼ばれない
+    expect(invokeChatBackend).toHaveBeenCalledWith({
+      backendUrl: 'https://backend.example',
+      backendSecret: 'secret',
+      lineUserId: 'U-parity-1',
+      message: 'AIの導入について相談したいです',
+    });
+    expect(fetchBookingSlots).not.toHaveBeenCalled();
+    expect(upsertChatBookingSession).not.toHaveBeenCalled();
+    expect(lineClientMocks.replyMessage).toHaveBeenCalledWith(replyToken, [
+      expect.objectContaining({ type: 'text', text: 'かしこまりました。今どんなことに時間を取られていますか？' }),
+    ]);
+  });
+
   test('明示的な予約意図の自由文（例: 「無料相談を予約したい」）: AIを介さず直接fetchBookingSlots→日付ピッカーFlexへ入る（2026-07-17 STEP1）', async () => {
     vi.mocked(isChatParityEnabled).mockReturnValue(true);
     vi.mocked(fetchBookingSlots).mockResolvedValue({
@@ -1221,6 +1267,104 @@ describe('POST /webhook — chat booking flow (会話中のセッション)', ()
 
     expect(clearChatBookingSession).toHaveBeenCalledWith(expect.anything(), 'friend-booking-1');
     expect(upsertChatBookingSession).not.toHaveBeenCalled();
+  });
+
+  // 2026-07-17 実機バグ再現テスト（受け入れテスト①）: 予約枠選択中(awaiting_slot_selection)
+  // に「リセット」と送っても無視され、「上に表示された候補から…」に吸われていた。
+  // 「最初から」と同じ完全リセットとして扱われることを検証する。
+  test('reset command "リセット" (not just "最初から") clears the session from awaiting_slot_selection — regression: 実機バグ', async () => {
+    vi.mocked(getChatBookingSession).mockResolvedValue({
+      friendId: 'friend-booking-1',
+      state: 'awaiting_slot_selection',
+      selectedStart: null,
+      selectedEnd: null,
+      name: null,
+      updatedAt: '2026-07-01T12:00:00.000',
+    });
+    vi.mocked(invokeChatBackend).mockResolvedValue({
+      reply: 'かしこまりました。これまでの会話内容をリセットしました。最初からご相談どうぞ。',
+      book: false,
+      escalate: false,
+    });
+
+    const { replyToken } = await postBookingStep('リセット');
+
+    expect(clearChatBookingSession).toHaveBeenCalledWith(expect.anything(), 'friend-booking-1');
+    expect(upsertChatBookingSession).not.toHaveBeenCalled();
+    // 予約の入力を最初からやり直す旨の定型文で、必ずreplyTokenを消費する
+    expect(lineClientMocks.replyMessage).toHaveBeenCalledWith(replyToken, [
+      expect.objectContaining({ text: expect.stringContaining('最初からやり直します') }),
+    ]);
+  });
+
+  // 受け入れテスト①の後半: 「リセット」「最初から」等の完全リセットは、予約サブフロー
+  // だけでなくAI相談の会話記憶（satoyama側 conversationsテーブル）もクリアする必要がある。
+  // ここではHarness側が invokeChatBackend() 経由でリセット文言をベストエフォート転送する
+  // ことだけを検証する（実際のconversationsクリア自体はsatoyama側の責務・別リポジトリ）。
+  test('full reset ("リセット"/"最初から") forwards the reset text to the AI backend so satoyama-side conversation memory clears too', async () => {
+    vi.mocked(getChatBookingSession).mockResolvedValue({
+      friendId: 'friend-booking-1',
+      state: 'awaiting_email',
+      selectedStart: '2026-08-01T01:00:00.000Z',
+      selectedEnd: '2026-08-01T01:30:00.000Z',
+      name: '山田太郎',
+      updatedAt: '2026-07-01T12:00:00.000',
+    });
+    vi.mocked(invokeChatBackend).mockResolvedValue({
+      reply: 'かしこまりました。これまでの会話内容をリセットしました。最初からご相談どうぞ。',
+      book: false,
+      escalate: false,
+    });
+
+    await postBookingStep('リセット');
+
+    expect(invokeChatBackend).toHaveBeenCalledWith({
+      backendUrl: 'https://backend.example',
+      backendSecret: 'secret',
+      lineUserId: 'U-booking-1',
+      message: 'リセット',
+    });
+  });
+
+  // 「キャンセル」は予約サブフローだけを取り消す表現であり、AI相談の会話記憶までは
+  // 消さない（意味が異なる：予約をやめたいだけで、それまでのAI相談内容を消したい
+  // わけではない）。invokeChatBackendは呼ばれないことを検証する。
+  test('"キャンセル" clears only the booking session, does NOT forward to the AI backend (会話記憶は残す)', async () => {
+    vi.mocked(getChatBookingSession).mockResolvedValue({
+      friendId: 'friend-booking-1',
+      state: 'awaiting_slot_selection',
+      selectedStart: null,
+      selectedEnd: null,
+      name: null,
+      updatedAt: '2026-07-01T12:00:00.000',
+    });
+
+    await postBookingStep('キャンセル');
+
+    expect(clearChatBookingSession).toHaveBeenCalledWith(expect.anything(), 'friend-booking-1');
+    expect(invokeChatBackend).not.toHaveBeenCalled();
+  });
+
+  // ベストエフォート性の検証: バックエンド呼び出しが失敗しても、予約フロー向けの
+  // ローカルなリプライ（replyToken消費）は必ず届く。
+  test('full reset still replies to the user even if the best-effort AI backend reset call throws', async () => {
+    vi.mocked(getChatBookingSession).mockResolvedValue({
+      friendId: 'friend-booking-1',
+      state: 'awaiting_slot_selection',
+      selectedStart: null,
+      selectedEnd: null,
+      name: null,
+      updatedAt: '2026-07-01T12:00:00.000',
+    });
+    vi.mocked(invokeChatBackend).mockRejectedValue(new Error('chat backend error: 500 Internal Server Error'));
+
+    const { res, replyToken } = await postBookingStep('リセット');
+
+    expect(res.status).toBe(200);
+    expect(clearChatBookingSession).toHaveBeenCalledWith(expect.anything(), 'friend-booking-1');
+    expect(lineClientMocks.replyMessage).toHaveBeenCalledWith(replyToken, [
+      expect.objectContaining({ text: expect.stringContaining('最初からやり直します') }),
+    ]);
   });
 
   test('awaiting_slot_selection + unrelated free text: reminds the user to tap a button, does not advance state', async () => {

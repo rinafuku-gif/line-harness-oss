@@ -304,8 +304,60 @@ async function appendDayPickerFlexIfAvailable(
   }
 }
 
-const CHAT_BOOKING_RESET_COMMANDS = ['最初から', 'キャンセル'];
+/**
+ * 完全リセット語 — 予約サブフロー（chatBookingSession・このリポジトリのD1）と、
+ * AI相談の会話記憶（satoyama側 conversations テーブル）の**両方**をクリアする。
+ *
+ * 2026-07-17 修正（実機バグ: 予約枠選択中に「リセット」と送っても無視され、
+ * 「上に表示された候補からタップして…」に吸われる事故）。旧版は「最初から」
+ * 「キャンセル」しか認識しておらず「リセット」が抜けていた。
+ *
+ * satoyama側（server/_core/lineChatRoute.ts の CONVERSATION_RESET_COMMANDS）と
+ * 語彙を完全一致させてある — 通常会話中（chatBookingSessionが無い状態）の
+ * これらの語は isExplicitBookingIntent() に一致せず invokeChatBackend() を素通しで
+ * 呼ぶため、satoyama側が自然に会話記憶をリセットする。一方この配列は「予約サブ
+ * フロー進行中はここ (handleChatBookingTextStep) が先に処理し invokeChatBackend() を
+ * 一切呼ばない」ため、予約中のリセットではローカルのセッションクリアに加えて
+ * 明示的に resetBackendConversationBestEffort() を呼び、AI側の記憶も揃えて消す。
+ * 変更する場合は両リポジトリを同時に直すこと（片方だけ増減すると「予約中は
+ * リセットが効くのに通常会話では効かない」ような状態差異が起きる）。
+ */
+const CHAT_BOOKING_FULL_RESET_COMMANDS = [
+  'リセット',
+  '最初から',
+  'はじめから',
+  '会話をリセット',
+  '最初からやり直す',
+  '最初からやり直したい',
+];
+/** 予約サブフローだけをキャンセルする表現。AI相談の会話記憶までは消さない。 */
+const CHAT_BOOKING_CANCEL_ONLY_COMMANDS = ['キャンセル'];
 const CHAT_BOOKING_NO_EMAIL_KEYWORDS = ['なし', 'ない', '無し', 'skip', 'スキップ'];
+
+/**
+ * 予約サブフロー進行中に完全リセット語を受け取った場合、satoyama側のAI相談の
+ * 会話記憶もベストエフォートでクリアする（CHAT_BOOKING_FULL_RESET_COMMANDS の
+ * コメント参照）。バックエンド未設定・呼び出し失敗時は静かに諦める — ローカルの
+ * 予約セッションクリアは呼び出し元で既に完了させる前提のため、ここが失敗しても
+ * ユーザーへの返信（予約フロー向け定型文）は必ず届く。
+ */
+async function resetBackendConversationBestEffort(
+  chatEnv: Pick<ChatBackendEnv, 'backendUrl' | 'backendSecret'>,
+  lineUserId: string,
+  resetText: string,
+): Promise<void> {
+  if (!chatEnv.backendUrl || !chatEnv.backendSecret) return;
+  try {
+    await invokeChatBackend({
+      backendUrl: chatEnv.backendUrl,
+      backendSecret: chatEnv.backendSecret,
+      lineUserId,
+      message: resetText,
+    });
+  } catch (err) {
+    console.error('[webhook] best-effort backend conversation reset failed', err);
+  }
+}
 
 /** セッション進行中に届いたテキストメッセージ（氏名/メール入力・リセット・迷子ガード）を処理する。 */
 async function handleChatBookingTextStep(
@@ -319,8 +371,12 @@ async function handleChatBookingTextStep(
 ): Promise<void> {
   const trimmed = incomingText.trim();
 
-  if (CHAT_BOOKING_RESET_COMMANDS.includes(trimmed)) {
+  const isFullReset = CHAT_BOOKING_FULL_RESET_COMMANDS.includes(trimmed);
+  if (isFullReset || CHAT_BOOKING_CANCEL_ONLY_COMMANDS.includes(trimmed)) {
     await clearChatBookingSession(db, friend.id);
+    if (isFullReset) {
+      await resetBackendConversationBestEffort(chatEnv, friend.line_user_id, trimmed);
+    }
     const msg = buildMessage(
       'text',
       '予約の入力を最初からやり直します。改めて「無料相談を予約したい」とお送りください。',
