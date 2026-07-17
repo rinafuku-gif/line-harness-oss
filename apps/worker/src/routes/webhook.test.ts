@@ -81,6 +81,10 @@ vi.mock('../services/chatBackend.js', async () => {
     groupSlotsByJstDay: vi.fn().mockReturnValue([]),
     filterSlotsByJstDay: vi.fn().mockReturnValue([]),
     buildQuickReplyItems: actual.buildQuickReplyItems,
+    // isExplicitBookingIntent / BOOKING_QUICK_REPLY_LABEL は決定論的な純粋関数・定数
+    // （2026-07-17 STEP1追加）のため、buildQuickReplyItemsと同様に実装をそのまま使う。
+    isExplicitBookingIntent: actual.isExplicitBookingIntent,
+    BOOKING_QUICK_REPLY_LABEL: actual.BOOKING_QUICK_REPLY_LABEL,
   };
 });
 
@@ -620,7 +624,11 @@ describe('POST /webhook — chat parity (external chat backend, Ryo限定テス�
     };
   }
 
-  async function postParity(envOverrides: Record<string, unknown>, text = '無料相談を予約したい') {
+  // 2026-07-17 STEP1: デフォルト文言は isExplicitBookingIntent() に一致しない
+  // 中立な発話にする（「予約管理を自動化したい」等の業務ワードは対象外・
+  // chatSystemPrompt.tsの「予約管理」誤発火注意と同じ理由）。明示的な予約意図を
+  // 検証したいテストは text 引数で個別に上書きする。
+  async function postParity(envOverrides: Record<string, unknown>, text = '予約管理を自動化したい') {
     const replyToken = 'reply-token-parity';
     const stmt = makeStmt();
     const db = { prepare: vi.fn().mockReturnValue(stmt) } as unknown as D1Database;
@@ -709,7 +717,7 @@ describe('POST /webhook — chat parity (external chat backend, Ryo限定テス�
       backendUrl: 'https://backend.example',
       backendSecret: 'secret',
       lineUserId: 'U-parity-1',
-      message: '無料相談を予約したい',
+      message: '予約管理を自動化したい',
     });
     expect(lineClientMocks.replyMessage).toHaveBeenCalledWith(replyToken, [
       { type: 'text', text: 'Webと同じトーンの返信です' },
@@ -718,9 +726,39 @@ describe('POST /webhook — chat parity (external chat backend, Ryo限定テス�
     expect(fetchBookingSlots).not.toHaveBeenCalled();
   });
 
-  test('gate open + backend success + book=true + slots available: sends reply text + day picker flex, and opens a booking session', async () => {
+  test('gate open + backend success + book=true (non-explicit text): AIの判定だけでは即Flexを出さず、「無料相談を予約する」クイックリプライボタンだけを添える（2026-07-17 STEP1構造変更）', async () => {
     vi.mocked(isChatParityEnabled).mockReturnValue(true);
     vi.mocked(invokeChatBackend).mockResolvedValue({ reply: '空いている日時をお伝えしますね', book: true, escalate: false });
+    vi.mocked(buildMessage).mockReturnValue({ type: 'text', text: '空いている日時をお伝えしますね' });
+    vi.mocked(messageToLogPayload).mockReturnValue({ messageType: 'text', content: '空いている日時をお伝えしますね' });
+
+    const { res, replyToken } = await postParity(
+      {
+        GEMINI_API_KEY: 'test-gemini-key',
+        CHAT_BACKEND_URL: 'https://backend.example',
+        CHAT_BACKEND_SECRET: 'secret',
+        CHAT_PARITY_TEST_USER_IDS: 'U-parity-1',
+      },
+      '予約管理を自動化したい', // isExplicitBookingIntent()に一致しない業務文脈の発話
+    );
+
+    expect(res.status).toBe(200);
+    // book=trueだけではFlexを出さない・fetchBookingSlotsは呼ばれない・セッションも開かない
+    expect(fetchBookingSlots).not.toHaveBeenCalled();
+    expect(upsertChatBookingSession).not.toHaveBeenCalled();
+    expect(lineClientMocks.replyMessage).toHaveBeenCalledWith(replyToken, [
+      {
+        type: 'text',
+        text: '空いている日時をお伝えしますね',
+        quickReply: {
+          items: [{ type: 'action', action: { type: 'message', label: '無料相談を予約する', text: '無料相談を予約する' } }],
+        },
+      },
+    ]);
+  });
+
+  test('明示的な予約意図の自由文（例: 「無料相談を予約したい」）: AIを介さず直接fetchBookingSlots→日付ピッカーFlexへ入る（2026-07-17 STEP1）', async () => {
+    vi.mocked(isChatParityEnabled).mockReturnValue(true);
     vi.mocked(fetchBookingSlots).mockResolvedValue({
       ok: true,
       slots: [{ start: '2026-08-01T01:00:00.000Z', end: '2026-08-01T01:30:00.000Z' }],
@@ -733,26 +771,87 @@ describe('POST /webhook — chat parity (external chat backend, Ryo限定テス�
       },
     ]);
     vi.mocked(buildMessage).mockImplementation((type) =>
-      type === 'flex' ? { type: 'flex', altText: 'x', contents: {} } : { type: 'text', text: '空いている日時をお伝えしますね' },
+      type === 'flex'
+        ? { type: 'flex', altText: 'x', contents: {} }
+        : { type: 'text', text: 'かしこまりました。ご希望の日を選んでください。' },
     );
     vi.mocked(messageToLogPayload).mockReturnValue({ messageType: 'text', content: 'x' });
 
-    const { res, replyToken } = await postParity({
-      GEMINI_API_KEY: 'test-gemini-key',
-      CHAT_BACKEND_URL: 'https://backend.example',
-      CHAT_BACKEND_SECRET: 'secret',
-      CHAT_PARITY_TEST_USER_IDS: 'U-parity-1',
-    });
+    const { res, replyToken } = await postParity(
+      {
+        GEMINI_API_KEY: 'test-gemini-key',
+        CHAT_BACKEND_URL: 'https://backend.example',
+        CHAT_BACKEND_SECRET: 'secret',
+        CHAT_PARITY_TEST_USER_IDS: 'U-parity-1',
+      },
+      '無料相談を予約したい',
+    );
 
     expect(res.status).toBe(200);
+    // AIは介さない（invokeChatBackendは呼ばれない）
+    expect(invokeChatBackend).not.toHaveBeenCalled();
     expect(fetchBookingSlots).toHaveBeenCalledWith({ backendUrl: 'https://backend.example', backendSecret: 'secret' });
     expect(lineClientMocks.replyMessage).toHaveBeenCalledWith(replyToken, [
-      { type: 'text', text: '空いている日時をお伝えしますね' },
+      { type: 'text', text: 'かしこまりました。ご希望の日を選んでください。' },
       { type: 'flex', altText: 'x', contents: {} },
     ]);
     expect(upsertChatBookingSession).toHaveBeenCalledWith(expect.anything(), 'friend-parity-1', {
       state: 'awaiting_slot_selection',
     });
+  });
+
+  test('「無料相談を予約する」ボタン（クイックリプライのラベルそのもの）を押した場合も、直接日付ピッカーFlexへ入る', async () => {
+    vi.mocked(isChatParityEnabled).mockReturnValue(true);
+    vi.mocked(fetchBookingSlots).mockResolvedValue({
+      ok: true,
+      slots: [{ start: '2026-08-01T01:00:00.000Z', end: '2026-08-01T01:30:00.000Z' }],
+    });
+    vi.mocked(groupSlotsByJstDay).mockReturnValue([
+      { dateKey: '2026-08-01', label: '8/1(土)', slots: [{ start: '2026-08-01T01:00:00.000Z', end: '2026-08-01T01:30:00.000Z' }] },
+    ]);
+    vi.mocked(buildMessage).mockImplementation((type) =>
+      type === 'flex'
+        ? { type: 'flex', altText: 'x', contents: {} }
+        : { type: 'text', text: 'かしこまりました。ご希望の日を選んでください。' },
+    );
+    vi.mocked(messageToLogPayload).mockReturnValue({ messageType: 'text', content: 'x' });
+
+    await postParity(
+      {
+        GEMINI_API_KEY: 'test-gemini-key',
+        CHAT_BACKEND_URL: 'https://backend.example',
+        CHAT_BACKEND_SECRET: 'secret',
+        CHAT_PARITY_TEST_USER_IDS: 'U-parity-1',
+      },
+      '無料相談を予約する',
+    );
+
+    expect(invokeChatBackend).not.toHaveBeenCalled();
+    expect(fetchBookingSlots).toHaveBeenCalledTimes(1);
+  });
+
+  test('明示的な予約意図だが空き枠0件: Flexは出さず、理由を伝えるテキストで終わる', async () => {
+    vi.mocked(isChatParityEnabled).mockReturnValue(true);
+    vi.mocked(fetchBookingSlots).mockResolvedValue({ ok: true, slots: [] });
+    vi.mocked(groupSlotsByJstDay).mockReturnValue([]);
+    vi.mocked(buildMessage).mockImplementation((_type, content) => ({ type: 'text', text: content as string }));
+    vi.mocked(messageToLogPayload).mockReturnValue({ messageType: 'text', content: 'x' });
+
+    const { replyToken } = await postParity(
+      {
+        GEMINI_API_KEY: 'test-gemini-key',
+        CHAT_BACKEND_URL: 'https://backend.example',
+        CHAT_BACKEND_SECRET: 'secret',
+        CHAT_PARITY_TEST_USER_IDS: 'U-parity-1',
+      },
+      '無料相談を予約したい',
+    );
+
+    expect(lineClientMocks.replyMessage).toHaveBeenCalledWith(replyToken, [
+      { type: 'text', text: 'かしこまりました。ご希望の日を選んでください。' },
+      { type: 'text', text: 'あいにく、ただいま空いている日時がございません。恐れ入りますが、担当者からのご連絡をお待ちください。' },
+    ]);
+    expect(upsertChatBookingSession).not.toHaveBeenCalled();
   });
 
   test('gate open + backend throws (timeout/network): falls back to existing Gemini flow, replyToken still gets consumed via fallback text', async () => {
@@ -809,7 +908,7 @@ describe('POST /webhook — chat parity (external chat backend, Ryo限定テス�
     ]);
   });
 
-  test('gate open + backend returns book=true + quickReplies: quick reply attaches to the last message (the day picker flex), not the text', async () => {
+  test('gate open + backend returns book=true + quickReplies: AI自身の選択肢と「無料相談を予約する」ボタンが同じテキストメッセージに並んで添付される（2026-07-17 STEP1で仕様変更・Flexは出さない）', async () => {
     vi.mocked(isChatParityEnabled).mockReturnValue(true);
     vi.mocked(invokeChatBackend).mockResolvedValue({
       reply: '空いている日時をお伝えしますね',
@@ -817,21 +916,8 @@ describe('POST /webhook — chat parity (external chat backend, Ryo限定テス�
       escalate: false,
       quickReplies: ['やっぱり検討します'],
     });
-    vi.mocked(fetchBookingSlots).mockResolvedValue({
-      ok: true,
-      slots: [{ start: '2026-08-01T01:00:00.000Z', end: '2026-08-01T01:30:00.000Z' }],
-    });
-    vi.mocked(groupSlotsByJstDay).mockReturnValue([
-      {
-        dateKey: '2026-08-01',
-        label: '8/1(土)',
-        slots: [{ start: '2026-08-01T01:00:00.000Z', end: '2026-08-01T01:30:00.000Z' }],
-      },
-    ]);
-    vi.mocked(buildMessage).mockImplementation((type) =>
-      type === 'flex' ? { type: 'flex', altText: 'x', contents: {} } : { type: 'text', text: '空いている日時をお伝えしますね' },
-    );
-    vi.mocked(messageToLogPayload).mockReturnValue({ messageType: 'text', content: 'x' });
+    vi.mocked(buildMessage).mockReturnValue({ type: 'text', text: '空いている日時をお伝えしますね' });
+    vi.mocked(messageToLogPayload).mockReturnValue({ messageType: 'text', content: '空いている日時をお伝えしますね' });
 
     const { replyToken } = await postParity({
       GEMINI_API_KEY: 'test-gemini-key',
@@ -840,14 +926,16 @@ describe('POST /webhook — chat parity (external chat backend, Ryo限定テス�
       CHAT_PARITY_TEST_USER_IDS: 'U-parity-1',
     });
 
+    expect(fetchBookingSlots).not.toHaveBeenCalled();
     expect(lineClientMocks.replyMessage).toHaveBeenCalledWith(replyToken, [
-      { type: 'text', text: '空いている日時をお伝えしますね' },
       {
-        type: 'flex',
-        altText: 'x',
-        contents: {},
+        type: 'text',
+        text: '空いている日時をお伝えしますね',
         quickReply: {
-          items: [{ type: 'action', action: { type: 'message', label: 'やっぱり検討します', text: 'やっぱり検討します' } }],
+          items: [
+            { type: 'action', action: { type: 'message', label: 'やっぱり検討します', text: 'やっぱり検討します' } },
+            { type: 'action', action: { type: 'message', label: '無料相談を予約する', text: '無料相談を予約する' } },
+          ],
         },
       },
     ]);

@@ -41,6 +41,8 @@ import {
   groupSlotsByJstDay,
   filterSlotsByJstDay,
   buildQuickReplyItems,
+  isExplicitBookingIntent,
+  BOOKING_QUICK_REPLY_LABEL,
   type BookingSlot,
 } from '../services/chatBackend.js';
 import {
@@ -261,6 +263,45 @@ async function handleChatBookingDaySelection(
     `${label}の空いている時間を選択してください`,
   );
   await sendReplyAndLog(lineClient, db, friend.id, replyToken, [flexMsg], 'chat_booking_flow');
+}
+
+/**
+ * ユーザー起点の予約導線（STEP1・2026-07-17追加）の入口。空き枠を取得し、日付ピッカー
+ * Flexを組み立てて messagesToSend の末尾に追加する（旧・chat parity book=true 即時分岐と
+ * ほぼ同じロジックを関数化。空き枠0件時に理由テキストを添えるようにした点のみ差分）。
+ * 呼び出し元: handleEvent内、ユーザーが isExplicitBookingIntent() に該当するメッセージを
+ * 送った場合のみ（AIの book 判定には一切依存しない）。
+ */
+async function appendDayPickerFlexIfAvailable(
+  db: D1Database,
+  friend: Friend,
+  messagesToSend: Message[],
+  chatEnv: Pick<ChatBackendEnv, 'backendUrl' | 'backendSecret'>,
+): Promise<void> {
+  if (!chatEnv.backendUrl || !chatEnv.backendSecret) return;
+
+  const slotsResult = await fetchBookingSlots({
+    backendUrl: chatEnv.backendUrl,
+    backendSecret: chatEnv.backendSecret,
+  });
+  const dayGroups = slotsResult.ok ? groupSlotsByJstDay(slotsResult.slots) : [];
+  if (slotsResult.ok && dayGroups.length > 0) {
+    messagesToSend.push(
+      buildMessage('flex', JSON.stringify(buildDayPickerFlexContents(dayGroups)), 'ご希望の日を選択してください'),
+    );
+    await upsertChatBookingSession(db, friend.id, { state: 'awaiting_slot_selection' });
+  } else if (slotsResult.ok) {
+    // 空き枠0件 — フローには入らず、担当者フォローに委ねる。呼び出し元の先頭メッセージ
+    // （「ご希望の日を選んでください」）だけで終わらせず、理由が分かるテキストを添える。
+    console.log(`[webhook] booking entry: no slots available friendId=${friend.id}`);
+    messagesToSend.push(
+      buildMessage('text', 'あいにく、ただいま空いている日時がございません。恐れ入りますが、担当者からのご連絡をお待ちください。'),
+    );
+  } else if (slotsResult.reason === 'not_configured' && slotsResult.message) {
+    messagesToSend.push(buildMessage('text', slotsResult.message));
+  } else {
+    console.error('[webhook] booking entry: slots fetch failed', slotsResult);
+  }
 }
 
 const CHAT_BOOKING_RESET_COMMANDS = ['最初から', 'キャンセル'];
@@ -1108,75 +1149,81 @@ async function handleEvent(
         chatBackendEnv.backendSecret &&
         isChatParityEnabled(userId, chatBackendEnv)
       ) {
-        const parityStart = Date.now();
-        try {
-          const backendReply = await invokeChatBackend({
-            backendUrl: chatBackendEnv.backendUrl,
-            backendSecret: chatBackendEnv.backendSecret,
-            lineUserId: userId,
-            message: incomingText,
-          });
-          console.log(`[webhook][perf] chat backend invoke: ${Date.now() - parityStart}ms`);
+        if (isExplicitBookingIntent(incomingText)) {
+          // ── ユーザー起点の予約導線（STEP1・2026-07-17追加） ──────────────
+          // 「無料相談を予約する」ボタンのタップ、または「予約したい」等の明示的な
+          // 自由文。AIを介さず、決定論的に日付ピッカーFlexへ入る（book判定に依存しない・
+          // services/chatBackend.ts の isExplicitBookingIntent() 参照）。
+          try {
+            const messagesToSend: Message[] = [
+              buildMessage('text', 'かしこまりました。ご希望の日を選んでください。'),
+            ];
+            await appendDayPickerFlexIfAvailable(db, friend, messagesToSend, chatBackendEnv);
+            await lineClient.replyMessage(event.replyToken, messagesToSend);
+            replyTokenConsumed = true;
+            handledByChatParity = true;
 
-          const messagesToSend: Message[] = [buildMessage('text', backendReply.reply)];
-
-          if (backendReply.book) {
-            const slotsResult = await fetchBookingSlots({
+            const { messageToLogPayload: logPayloadBookingEntry } = await import('../services/step-delivery.js');
+            for (const sentMsg of messagesToSend) {
+              await logOutgoingMessage(db, friend.id, logPayloadBookingEntry(sentMsg), 'chat_booking_flow');
+            }
+          } catch (err) {
+            console.error('[webhook] explicit booking intent entry failed', err);
+          }
+        } else {
+          const parityStart = Date.now();
+          try {
+            const backendReply = await invokeChatBackend({
               backendUrl: chatBackendEnv.backendUrl,
               backendSecret: chatBackendEnv.backendSecret,
+              lineUserId: userId,
+              message: incomingText,
             });
-            const dayGroups = slotsResult.ok ? groupSlotsByJstDay(slotsResult.slots) : [];
-            if (slotsResult.ok && dayGroups.length > 0) {
-              messagesToSend.push(
-                buildMessage(
-                  'flex',
-                  JSON.stringify(buildDayPickerFlexContents(dayGroups)),
-                  'ご希望の日を選択してください',
-                ),
-              );
-              await upsertChatBookingSession(db, friend.id, { state: 'awaiting_slot_selection' });
-            } else if (slotsResult.ok) {
-              // 空き枠0件 — フローには入らず、担当者フォローに委ねる（返信テキストのみ送信）。
-              console.log(`[webhook] chat parity book=true but no slots available friendId=${friend.id}`);
-            } else if (slotsResult.reason === 'not_configured' && slotsResult.message) {
-              messagesToSend.push(buildMessage('text', slotsResult.message));
-            } else {
-              console.error('[webhook] chat parity slots fetch failed', slotsResult);
+            console.log(`[webhook][perf] chat backend invoke: ${Date.now() - parityStart}ms`);
+
+            const messagesToSend: Message[] = [buildMessage('text', backendReply.reply)];
+
+            // 2026-07-17 STEP1変更: 旧仕様はbook=trueで即Flexを出していたが、
+            // 「1問答えただけで予約枠を押し付ける」事故の再発防止のため、book=trueは
+            // 「予約する」クイックリプライボタンを添えるだけに縮小した（Flexが実際に
+            // 出るのは isExplicitBookingIntent() の分岐のみ・上記コメント参照）。
+            let quickReplyOptions = backendReply.quickReplies ?? [];
+            if (backendReply.book) {
+              quickReplyOptions = [...quickReplyOptions, BOOKING_QUICK_REPLY_LABEL];
             }
-          }
 
-          if (backendReply.escalate) {
-            // Ryo宛の通知は satoyama 側で送信済み（契約: docs/line-booking-integration.md §3.3）。
-            // Harness側での追加送信は不要。観測用にログのみ残す。
-            console.log(`[webhook] chat parity escalate=true friendId=${friend.id}`);
-          }
-
-          // 2026-07-17追加: satoyama側が選択肢を機械可読で返してきた場合、LINEのクイック
-          // リプライ（タップ選択ボタン）として最後のメッセージに添付する。LINE側の仕様上、
-          // 返信メッセージ配列のうち実際に表示されるクイックリプライは最後の1つのみのため、
-          // 常に messagesToSend の末尾（book=true時はFlexの日付ピッカー、それ以外はテキスト
-          // 本文）に添付する。
-          if (backendReply.quickReplies && backendReply.quickReplies.length > 0 && messagesToSend.length > 0) {
-            const items = buildQuickReplyItems(backendReply.quickReplies);
-            if (items.length > 0) {
-              const lastIndex = messagesToSend.length - 1;
-              messagesToSend[lastIndex] = withQuickReply(messagesToSend[lastIndex], quickReply(items));
+            if (backendReply.escalate) {
+              // Ryo宛の通知は satoyama 側で送信済み（契約: docs/line-booking-integration.md §3.3）。
+              // Harness側での追加送信は不要。観測用にログのみ残す。
+              console.log(`[webhook] chat parity escalate=true friendId=${friend.id}`);
             }
-          }
 
-          await lineClient.replyMessage(event.replyToken, messagesToSend);
-          replyTokenConsumed = true;
-          handledByChatParity = true;
+            // satoyama側が選択肢（quickReplies）またはbook=trueを返してきた場合、LINEの
+            // クイックリプライ（タップ選択ボタン）として最後のメッセージに添付する。LINE側の
+            // 仕様上、返信メッセージ配列のうち実際に表示されるクイックリプライは最後の1つの
+            // みのため、常に messagesToSend の末尾（現状は常にテキスト本文のみ）に添付する。
+            if (quickReplyOptions.length > 0 && messagesToSend.length > 0) {
+              const items = buildQuickReplyItems(quickReplyOptions);
+              if (items.length > 0) {
+                const lastIndex = messagesToSend.length - 1;
+                messagesToSend[lastIndex] = withQuickReply(messagesToSend[lastIndex], quickReply(items));
+              }
+            }
 
-          const { messageToLogPayload: logPayloadChatParity } = await import('../services/step-delivery.js');
-          for (const sentMsg of messagesToSend) {
-            await logOutgoingMessage(db, friend.id, logPayloadChatParity(sentMsg), 'ai_consultation');
+            await lineClient.replyMessage(event.replyToken, messagesToSend);
+            replyTokenConsumed = true;
+            handledByChatParity = true;
+
+            const { messageToLogPayload: logPayloadChatParity } = await import('../services/step-delivery.js');
+            for (const sentMsg of messagesToSend) {
+              await logOutgoingMessage(db, friend.id, logPayloadChatParity(sentMsg), 'ai_consultation');
+            }
+          } catch (err) {
+            console.error(
+              `[webhook] chat parity backend failed after ${Date.now() - parityStart}ms, falling back to existing consultation`,
+              err,
+            );
           }
-        } catch (err) {
-          console.error(
-            `[webhook] chat parity backend failed after ${Date.now() - parityStart}ms, falling back to existing consultation`,
-            err,
-          );
         }
       }
 

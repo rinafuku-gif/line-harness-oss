@@ -99,6 +99,52 @@ export async function invokeChatBackend(opts: InvokeChatBackendOptions): Promise
   };
 }
 
+// ─── 予約導線のユーザー起点ゲート（STEP1・2026-07-17追加） ────────────────
+//
+// 背景: AIが[BOOK_CONSULTATION]（backendReply.book）を出した瞬間に日付ピッカーFlex
+// を出す旧仕様は、「1問答えただけで予約枠を押し付ける」体験になっていた
+// （プロンプト側の文言調整だけでは是正できず、gemini-2.5-flashが指示を無視する
+// 実例が2回発生・docs/line-booking-integration.md参照）。この事故はプロンプトの
+// 出力（book true/false）そのものに依存する限り再発しうるため、Flexを実際に出す
+// かどうかの最終判定はAI出力に一切依存させず、この2関数（決定論的な文字列一致）
+// だけで行う構造に変更した。book=trueの役割は「予約ボタンを返信に添えてよい」
+// だけに縮小し、Flexが実際に出るのは下記のいずれかのみ:
+//   (a) ユーザーが BOOKING_QUICK_REPLY_LABEL のボタンをタップした（＝そのラベル
+//       文字列がそのままテキストとして送られてくる）
+//   (b) ユーザー自身が「予約したい」等、人と話す/予約すること自体を明確に求める
+//       自由文を送った（webhook.ts側の予約フロー再開メッセージ「改めて『無料相談を
+//       予約したい』とお送りください」とも一致させている）
+
+/** LINEクイックリプライに添える「予約する」ボタンのラベル兼、タップ時に送信される文言。 */
+export const BOOKING_QUICK_REPLY_LABEL = '無料相談を予約する';
+
+/**
+ * 明示的な予約意図のキーワード集合。chatSystemPrompt.ts（satoyama側・別リポジトリ）が
+ * 「1回目の発言から人と話すことを明確に求めている場合の例外」として定義している語彙
+ * （話したい/相談したい/予約したい/電話したい）と揃えてある。
+ */
+const EXPLICIT_BOOKING_INTENT_KEYWORDS = [
+  '予約したい',
+  '予約します',
+  '予約希望',
+  '予約お願い',
+  '相談したい',
+  '話したい',
+  '電話したい',
+  '話を聞きたい',
+];
+
+/**
+ * incomingTextが「ユーザー自身が起点となった、明確な予約/相談の意思表示」かどうかを
+ * 判定する純関数。AIの応答（book/quickReplies）は一切参照しない。
+ */
+export function isExplicitBookingIntent(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) return false;
+  if (trimmed === BOOKING_QUICK_REPLY_LABEL) return true;
+  return EXPLICIT_BOOKING_INTENT_KEYWORDS.some((kw) => trimmed.includes(kw));
+}
+
 // ─── クイックリプライ（タップ選択ボタン） ──────────────────────────────────
 //
 // 2026-07-17追加。chatBackendReply.quickReplies（satoyama側で選択肢の出し方に沿って
