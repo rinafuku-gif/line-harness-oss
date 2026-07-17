@@ -85,6 +85,10 @@ vi.mock('../services/chatBackend.js', async () => {
     // （2026-07-17 STEP1追加）のため、buildQuickReplyItemsと同様に実装をそのまま使う。
     isExplicitBookingIntent: actual.isExplicitBookingIntent,
     BOOKING_QUICK_REPLY_LABEL: actual.BOOKING_QUICK_REPLY_LABEL,
+    // resolveQuickReplyOptions も同様に決定論的な純粋関数（2026-07-17 毎ターン常時表示化で
+    // 追加）のため実装をそのまま使う。モックすると「常に空にフォールバックしない」誤検知の
+    // テストになってしまう。
+    resolveQuickReplyOptions: actual.resolveQuickReplyOptions,
   };
 });
 
@@ -719,8 +723,13 @@ describe('POST /webhook — chat parity (external chat backend, Ryo限定テス�
       lineUserId: 'U-parity-1',
       message: '予約管理を自動化したい',
     });
+    // 2026-07-17追加: quickReplies無し・book=falseでも、Harness側の構造フォールバック
+    // （resolveQuickReplyOptions）により既定の3件クイックリプライが付く（詳細は
+    // 「falls back to the default 3-item quick reply」テスト参照）。このテストの主眼は
+    // invokeChatBackendの呼び出しパラメータとinvokeLLMが呼ばれないことの検証のため、
+    // quickReplyの中身はここでは緩く確認する。
     expect(lineClientMocks.replyMessage).toHaveBeenCalledWith(replyToken, [
-      { type: 'text', text: 'Webと同じトーンの返信です' },
+      expect.objectContaining({ type: 'text', text: 'Webと同じトーンの返信です' }),
     ]);
     expect(invokeLLM).not.toHaveBeenCalled();
     expect(fetchBookingSlots).not.toHaveBeenCalled();
@@ -987,7 +996,7 @@ describe('POST /webhook — chat parity (external chat backend, Ryo限定テス�
     ]);
   });
 
-  test('gate open + backend success without quickReplies: no quickReply property attached (従来通り)', async () => {
+  test('gate open + backend success without quickReplies and book=false: falls back to the default 3-item quick reply (2026-07-17 毎ターン常時表示化)', async () => {
     vi.mocked(isChatParityEnabled).mockReturnValue(true);
     vi.mocked(invokeChatBackend).mockResolvedValue({ reply: 'Webと同じトーンの返信です', book: false, escalate: false });
     vi.mocked(buildMessage).mockReturnValue({ type: 'text', text: 'Webと同じトーンの返信です' });
@@ -1000,8 +1009,46 @@ describe('POST /webhook — chat parity (external chat backend, Ryo限定テス�
       CHAT_PARITY_TEST_USER_IDS: 'U-parity-1',
     });
 
+    // satoyama側がquickReplies無し・book=falseを返しても、Harness側の構造フォールバック
+    // （resolveQuickReplyOptions）により、LINE画面には必ず何かタップできるボタンが付く。
     expect(lineClientMocks.replyMessage).toHaveBeenCalledWith(replyToken, [
-      { type: 'text', text: 'Webと同じトーンの返信です' },
+      {
+        type: 'text',
+        text: 'Webと同じトーンの返信です',
+        quickReply: {
+          items: [
+            { type: 'action', action: { type: 'message', label: 'もっと詳しく', text: 'もっと詳しく' } },
+            { type: 'action', action: { type: 'message', label: '別のことを相談する', text: '別のことを相談する' } },
+            { type: 'action', action: { type: 'message', label: '無料相談を予約する', text: '無料相談を予約する' } },
+          ],
+        },
+      },
+    ]);
+  });
+
+  test('gate open + backend returns book=true without quickReplies: falls back to booking button only, no duplicate default items (2026-07-17追加)', async () => {
+    vi.mocked(isChatParityEnabled).mockReturnValue(true);
+    vi.mocked(invokeChatBackend).mockResolvedValue({ reply: '個別に設計した方が良さそうです', book: true, escalate: false });
+    vi.mocked(buildMessage).mockReturnValue({ type: 'text', text: '個別に設計した方が良さそうです' });
+    vi.mocked(messageToLogPayload).mockReturnValue({ messageType: 'text', content: '個別に設計した方が良さそうです' });
+
+    const { replyToken } = await postParity({
+      GEMINI_API_KEY: 'test-gemini-key',
+      CHAT_BACKEND_URL: 'https://backend.example',
+      CHAT_BACKEND_SECRET: 'secret',
+      CHAT_PARITY_TEST_USER_IDS: 'U-parity-1',
+    });
+
+    // book=trueの場合は「無料相談を予約する」ボタンが既に非空を作るため、
+    // デフォルト3件フォールバックには落ちない（もっと詳しく／別のことを相談するは付かない）。
+    expect(lineClientMocks.replyMessage).toHaveBeenCalledWith(replyToken, [
+      {
+        type: 'text',
+        text: '個別に設計した方が良さそうです',
+        quickReply: {
+          items: [{ type: 'action', action: { type: 'message', label: '無料相談を予約する', text: '無料相談を予約する' } }],
+        },
+      },
     ]);
   });
 

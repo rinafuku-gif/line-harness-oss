@@ -20,6 +20,8 @@ import {
   QUICK_REPLY_LABEL_MAX_LENGTH,
   isExplicitBookingIntent,
   BOOKING_QUICK_REPLY_LABEL,
+  resolveQuickReplyOptions,
+  DEFAULT_QUICK_REPLY_FALLBACK,
 } from './chatBackend.js';
 
 function mockFetchResponse(overrides: {
@@ -586,5 +588,45 @@ describe('buildQuickReplyItems', () => {
 
   test('returns an empty array for an empty options list', () => {
     expect(buildQuickReplyItems([])).toEqual([]);
+  });
+});
+
+describe('resolveQuickReplyOptions', () => {
+  // 2026-07-17追加（毎ターン常時表示化）: satoyama側の応答(quickReplies/book)から
+  // 何を返しても、Harnessが最終的にLINEへ添付する選択肢は絶対に空にしないための
+  // 構造フォールバック。
+
+  test('passes through the AI-provided quickReplies unchanged when book=false', () => {
+    expect(resolveQuickReplyOptions(['予約対応', '発信', 'その他'], false)).toEqual([
+      '予約対応',
+      '発信',
+      'その他',
+    ]);
+  });
+
+  test('appends the booking button when book=true', () => {
+    expect(resolveQuickReplyOptions(['やっぱり検討します'], true)).toEqual([
+      'やっぱり検討します',
+      BOOKING_QUICK_REPLY_LABEL,
+    ]);
+  });
+
+  test('does not duplicate the booking button when the AI already included it (book=true)', () => {
+    expect(resolveQuickReplyOptions(['もっと詳しく', BOOKING_QUICK_REPLY_LABEL], true)).toEqual([
+      'もっと詳しく',
+      BOOKING_QUICK_REPLY_LABEL,
+    ]);
+  });
+
+  test('falls back to the default 3-item list when quickReplies is undefined and book=false (症状再現ケース: 判断着地ターンで選択肢が消える)', () => {
+    expect(resolveQuickReplyOptions(undefined, false)).toEqual([...DEFAULT_QUICK_REPLY_FALLBACK]);
+  });
+
+  test('falls back to the default 3-item list when quickReplies is an empty array and book=false', () => {
+    expect(resolveQuickReplyOptions([], false)).toEqual([...DEFAULT_QUICK_REPLY_FALLBACK]);
+  });
+
+  test('falls back to just the booking button (not the full default list) when quickReplies is undefined and book=true', () => {
+    expect(resolveQuickReplyOptions(undefined, true)).toEqual([BOOKING_QUICK_REPLY_LABEL]);
   });
 });

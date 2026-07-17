@@ -42,7 +42,7 @@ import {
   filterSlotsByJstDay,
   buildQuickReplyItems,
   isExplicitBookingIntent,
-  BOOKING_QUICK_REPLY_LABEL,
+  resolveQuickReplyOptions,
   type BookingSlot,
 } from '../services/chatBackend.js';
 import {
@@ -1243,10 +1243,12 @@ async function handleEvent(
             // 「1問答えただけで予約枠を押し付ける」事故の再発防止のため、book=trueは
             // 「予約する」クイックリプライボタンを添えるだけに縮小した（Flexが実際に
             // 出るのは isExplicitBookingIntent() の分岐のみ・上記コメント参照）。
-            let quickReplyOptions = backendReply.quickReplies ?? [];
-            if (backendReply.book) {
-              quickReplyOptions = [...quickReplyOptions, BOOKING_QUICK_REPLY_LABEL];
-            }
+            //
+            // 2026-07-17追加（毎ターン常時表示化）: satoyama側が選択肢を返さず、かつ
+            // book=falseの場合でも、resolveQuickReplyOptions() が固定の次アクション
+            // （もっと詳しく／別のことを相談する／無料相談を予約する）にフォールバック
+            // するため、quickReplyOptionsが空配列になることはない（chatBackend.ts参照）。
+            const quickReplyOptions = resolveQuickReplyOptions(backendReply.quickReplies, backendReply.book);
 
             if (backendReply.escalate) {
               // Ryo宛の通知は satoyama 側で送信済み（契約: docs/line-booking-integration.md §3.3）。
@@ -1258,6 +1260,7 @@ async function handleEvent(
             // クイックリプライ（タップ選択ボタン）として最後のメッセージに添付する。LINE側の
             // 仕様上、返信メッセージ配列のうち実際に表示されるクイックリプライは最後の1つの
             // みのため、常に messagesToSend の末尾（現状は常にテキスト本文のみ）に添付する。
+            // quickReplyOptionsは常に非空（上記フォールバック参照）だが、念のためガードは残す。
             if (quickReplyOptions.length > 0 && messagesToSend.length > 0) {
               const items = buildQuickReplyItems(quickReplyOptions);
               if (items.length > 0) {

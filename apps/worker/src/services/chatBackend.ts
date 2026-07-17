@@ -187,6 +187,43 @@ export function buildQuickReplyItems(options: string[]): QuickReplyActionItem[] 
   });
 }
 
+// ─── 常時表示フォールバック（2026-07-17追加） ──────────────────────────────
+//
+// 背景: satoyama側のプロンプト（chatSystemPrompt.ts の LINE_QUICK_REPLY_PROMPT_ADDENDUM）
+// は「判断に着地したターンにも固定の次アクション選択肢を出す」よう指示しているが、
+// LLMの指示追従は確率的（gemini-2.5-flashが同種の指示を無視した実例が過去に複数回
+// 発生・chatSystemPrompt.ts参照）であり、プロンプトだけに頼るとまた無言で選択肢が
+// 消える回帰が起こりうる。この関数は「satoyama側が何を返してきても、Harnessが
+// 組み立てる最終的なクイックリプライは絶対に空にしない」ことを保証する構造的な
+// 最終防衛ライン。
+//
+// 責務分担: satoyama側（AI）は「会話の内容に応じた選択肢」を出す責務、Harness側
+// （この関数）は「LINEのUIとして毎ターン必ず何かタップできる状態にする」という
+// “画面表示の契約”を守る責務、と役割を分けている。予約ボタンのラベル・実際に
+// タップされたときの処理（isExplicitBookingIntent）は既存の仕組みをそのまま使う
+// （新しい経路を発明しない）。
+
+/** quickRepliesが空のときに表示する固定の次アクション（LINE_QUICK_REPLY_PROMPT_ADDENDUMの文言と揃えてある）。 */
+export const DEFAULT_QUICK_REPLY_FALLBACK: readonly string[] = [
+  'もっと詳しく',
+  '別のことを相談する',
+  BOOKING_QUICK_REPLY_LABEL,
+];
+
+/**
+ * satoyama側の応答（quickReplies・book）から、Harnessが実際にLINEへ添付する
+ * クイックリプライの選択肢一覧を決定する純関数。
+ * - book=trueの場合は「無料相談を予約する」ボタンを末尾に加える（AI自身の
+ *   quickReplies内に既に同じ文言が含まれていれば重複させない）。
+ * - 上記の結果、選択肢が1件も無ければ {@link DEFAULT_QUICK_REPLY_FALLBACK} を返す
+ *   （＝毎ターン必ず何かしらタップできるボタンが付く）。
+ */
+export function resolveQuickReplyOptions(quickReplies: string[] | undefined, book: boolean): string[] {
+  const base = quickReplies ?? [];
+  const withBooking = book && !base.includes(BOOKING_QUICK_REPLY_LABEL) ? [...base, BOOKING_QUICK_REPLY_LABEL] : base;
+  return withBooking.length > 0 ? withBooking : [...DEFAULT_QUICK_REPLY_FALLBACK];
+}
+
 // ─── 空き枠取得（GET /api/line/booking/slots） ────────────────────────────
 
 export interface BookingSlot {
