@@ -48,6 +48,14 @@ export interface ChatBackendReply {
   reply: string;
   book: boolean;
   escalate: boolean;
+  /**
+   * 2026-07-17追加。バックエンド（satoyama-ai-base server/_core/lineChatRoute.ts）が
+   * AIの選択肢提示を機械可読で返す場合のみ入る（契約: docs/line-booking-integration.md
+   * §3.3）。存在する場合、Harness側は {@link buildQuickReplyItems} でLINEのクイック
+   * リプライ（タップ選択ボタン）に変換して返信に添付する。無ければ従来通り
+   * クイックリプライ無しで返信する。
+   */
+  quickReplies?: string[];
 }
 
 export interface InvokeChatBackendOptions {
@@ -78,7 +86,50 @@ export async function invokeChatBackend(opts: InvokeChatBackendOptions): Promise
     throw new Error('chat backend returned no reply text');
   }
 
-  return { reply: json.reply, book: Boolean(json.book), escalate: Boolean(json.escalate) };
+  const quickReplies =
+    Array.isArray(json.quickReplies) && json.quickReplies.length > 0
+      ? json.quickReplies.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+      : undefined;
+
+  return {
+    reply: json.reply,
+    book: Boolean(json.book),
+    escalate: Boolean(json.escalate),
+    quickReplies: quickReplies && quickReplies.length > 0 ? quickReplies : undefined,
+  };
+}
+
+// ─── クイックリプライ（タップ選択ボタン） ──────────────────────────────────
+//
+// 2026-07-17追加。chatBackendReply.quickReplies（satoyama側で選択肢の出し方に沿って
+// 生成された文字列配列）を、LINEのクイックリプライ用アクション配列に変換する。
+// タップするとlabel文字列がそのままユーザー発言としてLINEに送信され、次の
+// invokeChatBackend呼び出しのmessageになる（新しいセッション状態は不要）。
+
+/** LINEクイックリプライの仕様上限（label最大20文字・1メッセージにつき最大13件）。 */
+export const QUICK_REPLY_LABEL_MAX_LENGTH = 20;
+export const QUICK_REPLY_MAX_ITEMS = 13;
+
+export interface QuickReplyActionItem {
+  type: 'action';
+  action: { type: 'message'; label: string; text: string };
+}
+
+/**
+ * satoyama側は既にLINEの制約（最大13個・15字程度のラベル）に沿って選択肢を返す設計だが、
+ * Harness側でも独立に安全側の上限を適用する（多層防御・プロンプトの追従率に依存しない）。
+ * label（ボタン表示・最大20文字）とtext（タップ時に送信される文言）は同じ文字列を使う
+ * （ボタンに書かれた通りの発言が送られる方が、ユーザーにとって直感的なため）。
+ */
+export function buildQuickReplyItems(options: string[]): QuickReplyActionItem[] {
+  return options.slice(0, QUICK_REPLY_MAX_ITEMS).map((option) => {
+    const label =
+      option.length > QUICK_REPLY_LABEL_MAX_LENGTH ? option.slice(0, QUICK_REPLY_LABEL_MAX_LENGTH) : option;
+    return {
+      type: 'action',
+      action: { type: 'message', label, text: option },
+    };
+  });
 }
 
 // ─── 空き枠取得（GET /api/line/booking/slots） ────────────────────────────

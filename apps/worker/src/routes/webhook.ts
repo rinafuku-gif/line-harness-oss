@@ -1,5 +1,5 @@
 import { Hono } from 'hono';
-import { verifySignature, LineClient } from '@line-crm/line-sdk';
+import { verifySignature, LineClient, quickReply, withQuickReply } from '@line-crm/line-sdk';
 import type { WebhookRequestBody, WebhookEvent, TextEventMessage, Message } from '@line-crm/line-sdk';
 import { createStickerMessageContent } from '@line-crm/shared';
 import {
@@ -40,6 +40,7 @@ import {
   parseDayPostbackData,
   groupSlotsByJstDay,
   filterSlotsByJstDay,
+  buildQuickReplyItems,
   type BookingSlot,
 } from '../services/chatBackend.js';
 import {
@@ -1148,6 +1149,19 @@ async function handleEvent(
             // Ryo宛の通知は satoyama 側で送信済み（契約: docs/line-booking-integration.md §3.3）。
             // Harness側での追加送信は不要。観測用にログのみ残す。
             console.log(`[webhook] chat parity escalate=true friendId=${friend.id}`);
+          }
+
+          // 2026-07-17追加: satoyama側が選択肢を機械可読で返してきた場合、LINEのクイック
+          // リプライ（タップ選択ボタン）として最後のメッセージに添付する。LINE側の仕様上、
+          // 返信メッセージ配列のうち実際に表示されるクイックリプライは最後の1つのみのため、
+          // 常に messagesToSend の末尾（book=true時はFlexの日付ピッカー、それ以外はテキスト
+          // 本文）に添付する。
+          if (backendReply.quickReplies && backendReply.quickReplies.length > 0 && messagesToSend.length > 0) {
+            const items = buildQuickReplyItems(backendReply.quickReplies);
+            if (items.length > 0) {
+              const lastIndex = messagesToSend.length - 1;
+              messagesToSend[lastIndex] = withQuickReply(messagesToSend[lastIndex], quickReply(items));
+            }
           }
 
           await lineClient.replyMessage(event.replyToken, messagesToSend);

@@ -63,20 +63,26 @@ vi.mock('../services/chatBookingSession.js', () => ({
 
 // 外部チャットバックエンド連携 — デフォルトはゲート閉（isChatParityEnabled=false）で
 // 既存Gemini経路のテストに影響しないようにする。専用テストのみ個別に上書きする。
-vi.mock('../services/chatBackend.js', () => ({
-  isChatParityEnabled: vi.fn().mockReturnValue(false),
-  invokeChatBackend: vi.fn(),
-  fetchBookingSlots: vi.fn(),
-  submitBooking: vi.fn(),
-  formatSlotLabel: vi.fn((iso: string) => `label(${iso})`),
-  formatDayLabel: vi.fn((dateKey: string) => `day(${dateKey})`),
-  buildSlotPickerFlexContents: vi.fn().mockReturnValue({ type: 'bubble' }),
-  buildDayPickerFlexContents: vi.fn().mockReturnValue({ type: 'bubble', variant: 'day' }),
-  parseSlotPostbackData: vi.fn().mockReturnValue(null),
-  parseDayPostbackData: vi.fn().mockReturnValue(null),
-  groupSlotsByJstDay: vi.fn().mockReturnValue([]),
-  filterSlotsByJstDay: vi.fn().mockReturnValue([]),
-}));
+vi.mock('../services/chatBackend.js', async () => {
+  // buildQuickReplyItems は純粋な変換関数（LINEのlabel長・件数上限のトリミングのみ）
+  // のため、実装をそのまま使う（importActual）。他はモックのまま従来通り。
+  const actual = await vi.importActual<typeof import('../services/chatBackend.js')>('../services/chatBackend.js');
+  return {
+    isChatParityEnabled: vi.fn().mockReturnValue(false),
+    invokeChatBackend: vi.fn(),
+    fetchBookingSlots: vi.fn(),
+    submitBooking: vi.fn(),
+    formatSlotLabel: vi.fn((iso: string) => `label(${iso})`),
+    formatDayLabel: vi.fn((dateKey: string) => `day(${dateKey})`),
+    buildSlotPickerFlexContents: vi.fn().mockReturnValue({ type: 'bubble' }),
+    buildDayPickerFlexContents: vi.fn().mockReturnValue({ type: 'bubble', variant: 'day' }),
+    parseSlotPostbackData: vi.fn().mockReturnValue(null),
+    parseDayPostbackData: vi.fn().mockReturnValue(null),
+    groupSlotsByJstDay: vi.fn().mockReturnValue([]),
+    filterSlotsByJstDay: vi.fn().mockReturnValue([]),
+    buildQuickReplyItems: actual.buildQuickReplyItems,
+  };
+});
 
 import { verifySignature } from '@line-crm/line-sdk';
 import {
@@ -768,6 +774,101 @@ describe('POST /webhook — chat parity (external chat backend, Ryo限定テス�
     expect(invokeChatBackend).toHaveBeenCalledTimes(1);
     expect(invokeLLM).toHaveBeenCalledTimes(1);
     expect(lineClientMocks.replyMessage).toHaveBeenCalledWith(replyToken, [{ type: 'text', text: 'Gemini fallback reply' }]);
+  });
+
+  test('gate open + backend returns quickReplies: attaches a LINE quick reply to the text message (2026-07-17追加)', async () => {
+    vi.mocked(isChatParityEnabled).mockReturnValue(true);
+    vi.mocked(invokeChatBackend).mockResolvedValue({
+      reply: '今どんなことに困っていますか？',
+      book: false,
+      escalate: false,
+      quickReplies: ['予約対応', '発信', 'その他'],
+    });
+    vi.mocked(buildMessage).mockReturnValue({ type: 'text', text: '今どんなことに困っていますか？' });
+    vi.mocked(messageToLogPayload).mockReturnValue({ messageType: 'text', content: '今どんなことに困っていますか？' });
+
+    const { replyToken } = await postParity({
+      GEMINI_API_KEY: 'test-gemini-key',
+      CHAT_BACKEND_URL: 'https://backend.example',
+      CHAT_BACKEND_SECRET: 'secret',
+      CHAT_PARITY_TEST_USER_IDS: 'U-parity-1',
+    });
+
+    expect(lineClientMocks.replyMessage).toHaveBeenCalledWith(replyToken, [
+      {
+        type: 'text',
+        text: '今どんなことに困っていますか？',
+        quickReply: {
+          items: [
+            { type: 'action', action: { type: 'message', label: '予約対応', text: '予約対応' } },
+            { type: 'action', action: { type: 'message', label: '発信', text: '発信' } },
+            { type: 'action', action: { type: 'message', label: 'その他', text: 'その他' } },
+          ],
+        },
+      },
+    ]);
+  });
+
+  test('gate open + backend returns book=true + quickReplies: quick reply attaches to the last message (the day picker flex), not the text', async () => {
+    vi.mocked(isChatParityEnabled).mockReturnValue(true);
+    vi.mocked(invokeChatBackend).mockResolvedValue({
+      reply: '空いている日時をお伝えしますね',
+      book: true,
+      escalate: false,
+      quickReplies: ['やっぱり検討します'],
+    });
+    vi.mocked(fetchBookingSlots).mockResolvedValue({
+      ok: true,
+      slots: [{ start: '2026-08-01T01:00:00.000Z', end: '2026-08-01T01:30:00.000Z' }],
+    });
+    vi.mocked(groupSlotsByJstDay).mockReturnValue([
+      {
+        dateKey: '2026-08-01',
+        label: '8/1(土)',
+        slots: [{ start: '2026-08-01T01:00:00.000Z', end: '2026-08-01T01:30:00.000Z' }],
+      },
+    ]);
+    vi.mocked(buildMessage).mockImplementation((type) =>
+      type === 'flex' ? { type: 'flex', altText: 'x', contents: {} } : { type: 'text', text: '空いている日時をお伝えしますね' },
+    );
+    vi.mocked(messageToLogPayload).mockReturnValue({ messageType: 'text', content: 'x' });
+
+    const { replyToken } = await postParity({
+      GEMINI_API_KEY: 'test-gemini-key',
+      CHAT_BACKEND_URL: 'https://backend.example',
+      CHAT_BACKEND_SECRET: 'secret',
+      CHAT_PARITY_TEST_USER_IDS: 'U-parity-1',
+    });
+
+    expect(lineClientMocks.replyMessage).toHaveBeenCalledWith(replyToken, [
+      { type: 'text', text: '空いている日時をお伝えしますね' },
+      {
+        type: 'flex',
+        altText: 'x',
+        contents: {},
+        quickReply: {
+          items: [{ type: 'action', action: { type: 'message', label: 'やっぱり検討します', text: 'やっぱり検討します' } }],
+        },
+      },
+    ]);
+  });
+
+  test('gate open + backend success without quickReplies: no quickReply property attached (従来通り)', async () => {
+    vi.mocked(isChatParityEnabled).mockReturnValue(true);
+    vi.mocked(invokeChatBackend).mockResolvedValue({ reply: 'Webと同じトーンの返信です', book: false, escalate: false });
+    vi.mocked(buildMessage).mockReturnValue({ type: 'text', text: 'Webと同じトーンの返信です' });
+    vi.mocked(messageToLogPayload).mockReturnValue({ messageType: 'text', content: 'Webと同じトーンの返信です' });
+
+    const { replyToken } = await postParity({
+      GEMINI_API_KEY: 'test-gemini-key',
+      CHAT_BACKEND_URL: 'https://backend.example',
+      CHAT_BACKEND_SECRET: 'secret',
+      CHAT_PARITY_TEST_USER_IDS: 'U-parity-1',
+    });
+
+    expect(lineClientMocks.replyMessage).toHaveBeenCalledWith(replyToken, [
+      { type: 'text', text: 'Webと同じトーンの返信です' },
+    ]);
   });
 
   test('CHAT_PARITY_ENABLED="all" gate — a user not in CHAT_PARITY_TEST_USER_IDS still gets the new flow', async () => {

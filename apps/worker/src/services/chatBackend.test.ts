@@ -15,6 +15,9 @@ import {
   buildDayPostbackData,
   parseDayPostbackData,
   buildDayPickerFlexContents,
+  buildQuickReplyItems,
+  QUICK_REPLY_MAX_ITEMS,
+  QUICK_REPLY_LABEL_MAX_LENGTH,
 } from './chatBackend.js';
 
 function mockFetchResponse(overrides: {
@@ -114,6 +117,44 @@ describe('invokeChatBackend', () => {
     await expect(
       invokeChatBackend({ backendUrl: 'https://x', backendSecret: 's', lineUserId: 'U1', message: 'm' }),
     ).rejects.toThrow('no reply text');
+  });
+
+  test('passes through quickReplies when the backend returns a non-empty array (2026-07-17追加)', async () => {
+    vi.mocked(fetch).mockResolvedValue(
+      mockFetchResponse({
+        json: async () => ({ reply: '今どんなことに困っていますか？', book: false, escalate: false, quickReplies: ['予約対応', '発信', 'その他'] }),
+      }),
+    );
+
+    const result = await invokeChatBackend({ backendUrl: 'https://x', backendSecret: 's', lineUserId: 'U1', message: 'm' });
+    expect(result.quickReplies).toEqual(['予約対応', '発信', 'その他']);
+  });
+
+  test('omits quickReplies when the backend does not include it (defaults to undefined)', async () => {
+    vi.mocked(fetch).mockResolvedValue(mockFetchResponse({ json: async () => ({ reply: 'ok', book: false, escalate: false }) }));
+
+    const result = await invokeChatBackend({ backendUrl: 'https://x', backendSecret: 's', lineUserId: 'U1', message: 'm' });
+    expect(result.quickReplies).toBeUndefined();
+  });
+
+  test('treats an empty quickReplies array from the backend as undefined', async () => {
+    vi.mocked(fetch).mockResolvedValue(
+      mockFetchResponse({ json: async () => ({ reply: 'ok', book: false, escalate: false, quickReplies: [] }) }),
+    );
+
+    const result = await invokeChatBackend({ backendUrl: 'https://x', backendSecret: 's', lineUserId: 'U1', message: 'm' });
+    expect(result.quickReplies).toBeUndefined();
+  });
+
+  test('filters out non-string/empty entries in quickReplies (defensive against a malformed backend)', async () => {
+    vi.mocked(fetch).mockResolvedValue(
+      mockFetchResponse({
+        json: async () => ({ reply: 'ok', book: false, escalate: false, quickReplies: ['有効な選択肢', '', '  ', 42, null] }),
+      }),
+    );
+
+    const result = await invokeChatBackend({ backendUrl: 'https://x', backendSecret: 's', lineUserId: 'U1', message: 'm' });
+    expect(result.quickReplies).toEqual(['有効な選択肢']);
   });
 
   test('strips trailing slash from backendUrl before appending the path', async () => {
@@ -461,5 +502,37 @@ describe('buildDayPickerFlexContents', () => {
     expect(bubble.body.contents[0].action.label).toBe('8/1(土)・2枠');
     expect(bubble.body.contents[1].action.data).toBe('CHATBOOK_DAY:2026-08-02');
     expect(bubble.body.contents[1].action.label).toBe('8/2(日)・1枠');
+  });
+});
+
+describe('buildQuickReplyItems', () => {
+  // 2026-07-17追加: satoyama側(server/_core/lineChatRoute.ts)が返すquickReplies文字列
+  // 配列を、LINEのクイックリプライアクション配列に変換する。タップ時はlabelと同じ文言が
+  // そのままユーザー発言として送信される（message型アクション）。
+
+  test('converts each option into a message-type quick reply action (label === text)', () => {
+    const items = buildQuickReplyItems(['予約対応', '発信']);
+    expect(items).toEqual([
+      { type: 'action', action: { type: 'message', label: '予約対応', text: '予約対応' } },
+      { type: 'action', action: { type: 'message', label: '発信', text: '発信' } },
+    ]);
+  });
+
+  test(`caps the number of items at LINE's hard limit (${QUICK_REPLY_MAX_ITEMS}) even if the backend sends more`, () => {
+    const options = Array.from({ length: 20 }, (_, i) => `選択肢${i + 1}`);
+    const items = buildQuickReplyItems(options);
+    expect(items).toHaveLength(QUICK_REPLY_MAX_ITEMS);
+    expect(items[0].action.label).toBe('選択肢1');
+  });
+
+  test(`truncates a label longer than LINE's hard limit (${QUICK_REPLY_LABEL_MAX_LENGTH} chars) but keeps the full text as the tap payload`, () => {
+    const longOption = 'あ'.repeat(QUICK_REPLY_LABEL_MAX_LENGTH + 5);
+    const items = buildQuickReplyItems([longOption]);
+    expect(items[0].action.label).toHaveLength(QUICK_REPLY_LABEL_MAX_LENGTH);
+    expect(items[0].action.text).toBe(longOption);
+  });
+
+  test('returns an empty array for an empty options list', () => {
+    expect(buildQuickReplyItems([])).toEqual([]);
   });
 });
