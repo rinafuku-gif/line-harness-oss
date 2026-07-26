@@ -51,6 +51,11 @@ import {
   clearChatBookingSession,
   type ChatBookingSession,
 } from '../services/chatBookingSession.js';
+import {
+  cancelFriendOnboardingReminder,
+  scheduleFriendOnboardingReminder,
+  type SatoyamaOnboardingRuntimeConfig,
+} from '../services/satoyama-onboarding-reminder.js';
 import type { Env } from '../index.js';
 
 /** webhook.ts 内から handleEvent 系関数へ渡す、外部チャットバックエンド関連の env 束。 */
@@ -592,7 +597,7 @@ webhook.post('/webhook', async (c) => {
     };
     for (const event of body.events) {
       try {
-        await handleEvent(db, lineClient, event, channelAccessToken, matchedAccountId, c.env.WORKER_URL || new URL(c.req.url).origin, c.env.LIFF_URL, c.env.IMAGES, c.env.GEMINI_API_KEY, c.env.OWNER_LINE_USER_IDS, chatBackendEnv);
+        await handleEvent(db, lineClient, event, channelAccessToken, matchedAccountId, c.env.WORKER_URL || new URL(c.req.url).origin, c.env.LIFF_URL, c.env.IMAGES, c.env.GEMINI_API_KEY, c.env.OWNER_LINE_USER_IDS, chatBackendEnv, c.env);
       } catch (err) {
         console.error('Error handling webhook event:', err);
       }
@@ -616,23 +621,24 @@ async function handleEvent(
   geminiApiKey?: string,
   ownerLineUserIds?: string,
   chatBackendEnv: ChatBackendEnv = {},
+  onboardingEnv: SatoyamaOnboardingRuntimeConfig = {},
 ): Promise<void> {
   if (event.type === 'follow') {
     const userId =
       event.source.type === 'user' ? event.source.userId : undefined;
     if (!userId) return;
 
-    console.log(`[follow] userId=${userId} lineAccountId=${lineAccountId}`);
+    console.log(`[follow] event received accountConfigured=${Boolean(lineAccountId)}`);
 
     // プロフィール取得 & 友だち登録/更新
     let profile;
     try {
       profile = await lineClient.getProfile(userId);
-    } catch (err) {
-      console.error('Failed to get profile for', userId, err);
+    } catch {
+      console.error('[follow] profile fetch failed');
     }
 
-    console.log(`[follow] profile=${profile?.displayName ?? 'null'}`);
+    console.log(`[follow] profileFetched=${Boolean(profile)}`);
 
     const friend = await upsertFriend(db, {
       lineUserId: userId,
@@ -641,13 +647,25 @@ async function handleEvent(
       statusMessage: profile?.statusMessage ?? null,
     });
 
-    console.log(`[follow] friend.id=${friend.id} friend.line_account_id=${(friend as any).line_account_id}`);
+    console.log('[follow] friend upserted');
 
     // Set line_account_id for multi-account tracking (always update on follow)
     if (lineAccountId) {
       await db.prepare('UPDATE friends SET line_account_id = ?, updated_at = ? WHERE id = ?')
         .bind(lineAccountId, jstNow(), friend.id).run();
-      console.log(`[follow] line_account_id set to ${lineAccountId} for friend ${friend.id}`);
+      console.log('[follow] account boundary recorded');
+    }
+
+    // SATOYAMA onboarding is disabled by default and account-gated. Failure to
+    // schedule the optional reminder must never break normal friend-add flows.
+    try {
+      await scheduleFriendOnboardingReminder(db, {
+        lineAccountId,
+        friendId: friend.id,
+        env: onboardingEnv,
+      });
+    } catch {
+      console.error('[satoyama-onboarding] reminder schedule failed');
     }
 
     // Resolve referral link (entry_route) for this friend.
@@ -801,7 +819,19 @@ async function handleEvent(
       event.source.type === 'user' ? event.source.userId : undefined;
     if (!userId) return;
 
+    const friend = await getFriendByLineUserId(db, userId);
     await updateFriendFollowStatus(db, userId, false);
+    if (friend) {
+      try {
+        await cancelFriendOnboardingReminder(db, {
+          lineAccountId: lineAccountId ?? friend.line_account_id,
+          friendId: friend.id,
+          env: onboardingEnv,
+        });
+      } catch {
+        console.error('[satoyama-onboarding] reminder cancellation failed');
+      }
+    }
     return;
   }
 

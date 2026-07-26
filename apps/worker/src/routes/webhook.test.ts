@@ -42,6 +42,11 @@ vi.mock('../services/event-bus.js', () => ({
   fireEvent: vi.fn().mockResolvedValue(undefined),
 }));
 
+vi.mock('../services/satoyama-onboarding-reminder.js', () => ({
+  scheduleFriendOnboardingReminder: vi.fn().mockResolvedValue(undefined),
+  cancelFriendOnboardingReminder: vi.fn().mockResolvedValue(undefined),
+}));
+
 vi.mock('../services/step-delivery.js', () => ({
   buildMessage: vi.fn(),
   expandVariables: vi.fn(),

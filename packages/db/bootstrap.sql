@@ -217,6 +217,15 @@ CREATE TABLE calendar_bookings (
   updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours'))
 );
 
+CREATE TABLE chat_booking_sessions (
+  friend_id       TEXT PRIMARY KEY REFERENCES friends (id) ON DELETE CASCADE,
+  state           TEXT NOT NULL CHECK (state IN ('awaiting_slot_selection', 'awaiting_name', 'awaiting_email')),
+  selected_start  TEXT,
+  selected_end    TEXT,
+  name            TEXT,
+  updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours'))
+);
+
 CREATE TABLE chats (
   id            TEXT PRIMARY KEY,
   friend_id     TEXT NOT NULL REFERENCES friends (id) ON DELETE CASCADE,
@@ -637,6 +646,71 @@ CREATE TABLE rich_menu_pages (
   UNIQUE (group_id, order_index)
 );
 
+CREATE TABLE satoyama_onboarding_answer_events (
+  id                      TEXT PRIMARY KEY,
+  line_account_id         TEXT NOT NULL REFERENCES line_accounts(id) ON DELETE CASCADE,
+  friend_id               TEXT NOT NULL REFERENCES friends(id) ON DELETE CASCADE,
+  program_version         INTEGER NOT NULL,
+  idempotency_key         TEXT NOT NULL,
+  request_fingerprint     TEXT NOT NULL,
+  issue_code              TEXT NOT NULL CHECK (issue_code IN (
+                            'key_person', 'handoff', 'unsure_start', 'safe_rules', 'automation'
+                          )),
+  role_code               TEXT NOT NULL CHECK (role_code IN (
+                            'owner', 'internal_lead', 'frontline', 'supporter_solo'
+                          )),
+  area_code               TEXT NOT NULL CHECK (area_code IN (
+                            'admin', 'sales', 'hiring_training', 'content', 'undecided'
+                          )),
+  created_at              TEXT NOT NULL,
+  UNIQUE (
+    line_account_id,
+    friend_id,
+    program_version,
+    idempotency_key
+  ),
+  FOREIGN KEY (friend_id, line_account_id)
+    REFERENCES friends (id, line_account_id) ON DELETE CASCADE
+);
+
+CREATE TABLE satoyama_onboarding_states (
+  line_account_id          TEXT NOT NULL REFERENCES line_accounts(id) ON DELETE CASCADE,
+  friend_id                TEXT NOT NULL REFERENCES friends(id) ON DELETE CASCADE,
+  program_version          INTEGER NOT NULL DEFAULT 1,
+  status                   TEXT NOT NULL DEFAULT 'pending'
+                             CHECK (status IN ('pending', 'started', 'completed', 'skipped')),
+  issue_code               TEXT
+                             CHECK (issue_code IS NULL OR issue_code IN (
+                               'key_person', 'handoff', 'unsure_start', 'safe_rules', 'automation'
+                             )),
+  role_code                TEXT
+                             CHECK (role_code IS NULL OR role_code IN (
+                               'owner', 'internal_lead', 'frontline', 'supporter_solo'
+                             )),
+  area_code                TEXT
+                             CHECK (area_code IS NULL OR area_code IN (
+                               'admin', 'sales', 'hiring_training', 'content', 'undecided'
+                             )),
+  common_bonus_opened_at   TEXT,
+  questions_started_at     TEXT,
+  issue_bonus_opened_at    TEXT,
+  cta_clicked_at           TEXT,
+  reminder_due_at          TEXT,
+  reminder_claimed_at      TEXT,
+  reminder_sent_at         TEXT,
+  reminder_cancelled_at    TEXT,
+  reminder_attempts        INTEGER NOT NULL DEFAULT 0
+                             CHECK (reminder_attempts BETWEEN 0 AND 1),
+  reminder_error_code      TEXT,
+  unfollowed_at            TEXT,
+  completed_at             TEXT,
+  created_at               TEXT NOT NULL,
+  updated_at               TEXT NOT NULL,
+  PRIMARY KEY (line_account_id, friend_id, program_version),
+  FOREIGN KEY (friend_id, line_account_id)
+    REFERENCES friends (id, line_account_id) ON DELETE CASCADE
+);
+
 CREATE TABLE scenario_steps (
   id              TEXT PRIMARY KEY,
   scenario_id     TEXT NOT NULL REFERENCES scenarios (id) ON DELETE CASCADE,
@@ -891,7 +965,13 @@ CREATE INDEX idx_friend_scores_friend ON friend_scores (friend_id);
 
 CREATE INDEX idx_friend_tags_tag_id ON friend_tags (tag_id);
 
+CREATE UNIQUE INDEX idx_friends_id_line_account
+  ON friends (id, line_account_id);
+
 CREATE INDEX idx_friends_ig_igsid ON friends (ig_igsid);
+
+CREATE INDEX idx_friends_line_account_follow_updated
+  ON friends (line_account_id, is_following, updated_at);
 
 CREATE INDEX idx_friends_line_user_id ON friends (line_user_id);
 
@@ -937,6 +1017,22 @@ CREATE INDEX idx_rich_menu_areas_page     ON rich_menu_areas(page_id);
 CREATE INDEX idx_rich_menu_groups_account ON rich_menu_groups(account_id, status);
 
 CREATE INDEX idx_rich_menu_pages_group    ON rich_menu_pages(group_id, order_index);
+
+CREATE INDEX idx_satoyama_onboarding_due
+  ON satoyama_onboarding_states (
+    line_account_id,
+    reminder_due_at,
+    reminder_attempts,
+    status
+  );
+
+CREATE INDEX idx_satoyama_onboarding_events_friend
+  ON satoyama_onboarding_answer_events (
+    line_account_id,
+    friend_id,
+    program_version,
+    created_at
+  );
 
 CREATE INDEX idx_scenario_steps_scenario_id ON scenario_steps (scenario_id);
 
