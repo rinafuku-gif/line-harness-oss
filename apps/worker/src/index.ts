@@ -1,4 +1,4 @@
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import { cors } from 'hono/cors';
 import { LineClient } from '@line-crm/line-sdk';
 import {
@@ -576,6 +576,25 @@ ${longPressBlock}
 
 // Convenience redirect for /book path
 app.get('/book', (c) => c.redirect('/?page=book'));
+
+/**
+ * The LINE LIFF endpoint stays at the Worker root. A direct child-path visit
+ * (used for browser checks and safe explicit links) still needs the same root
+ * shell; the client then mounts only the dedicated onboarding bundle.
+ */
+export async function serveLiffIndex(c: Context<Env>): Promise<Response> {
+  if (!c.env.ASSETS || typeof c.env.ASSETS.fetch !== 'function') {
+    return c.json({ success: false, error: 'Not found' }, 404);
+  }
+  // Request the asset root rather than `/index.html`: both the Vite dev asset
+  // server and Workers Static Assets may canonicalize `/index.html` to `/`.
+  // Returning that redirect would erase the direct onboarding pathname.
+  const indexUrl = new URL('/', c.req.url);
+  return c.env.ASSETS.fetch(new Request(indexUrl, c.req.raw));
+}
+
+app.get('/onboarding/satoyama', serveLiffIndex);
+app.get('/onboarding/satoyama/', serveLiffIndex);
 
 // 404 fallback — API paths return JSON 404, everything else serves from static assets (LIFF/admin)
 export const notFoundHandler = async (c: Parameters<typeof app.notFound>[0] extends (ctx: infer C) => unknown ? C : never) => {

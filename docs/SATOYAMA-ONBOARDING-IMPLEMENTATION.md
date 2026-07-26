@@ -1,7 +1,7 @@
 # SATOYAMA LINE登録直後オンボーディング 実装記録
 
-確認日: 2026年7月26日
-状態: 隔離branch実装・検証済み。本番未反映
+確認日: 2026年7月27日
+状態: 隔離branchで本番直前の再監査・統合検証済み。本番反映作業中
 
 ## 1. 結論
 
@@ -14,6 +14,42 @@ SATOYAMA AI BASE専用のLIFFオンボーディングを、既存の汎用フォ
 
 実装は初期状態で停止している。SATOYAMAの対象account IDと有効化flagを明示しない限り、
 APIは404で閉じ、リマインダーも動かない。
+
+### 2026年7月27日の本番再監査で分かったこと
+
+事実と推論を分けるため、過去の記録だけでなくGit、Cloudflare、D1、LINE API、公開URLを
+再確認した。
+
+確認できた事実:
+
+- 現行Workerは`https://satoyama.r-inafuku.workers.dev`で、D1は`satoyama`
+  (`a45e126e-4f05-49db-ada2-fb9767fb892d`)である。
+- 現行Worker versionは`a7fd8991-cdec-4002-b92a-fe74ac549ffd`である。
+- 本番D1には`_migrations`管理表がなく、047の2 tableもまだ存在しない。
+- 047適用前のD1 Time Travel bookmarkとして
+  `000009e3-00000112-000050b4-656da4086c9151e1c4cb4c696296fae7`を記録した。
+- LINE公式アカウントは`SATOYAMA AI BASE`、Basic IDは`@969evmpq`、
+  Harness account IDは`c8e69a14-b590-4ce0-8910-fb2b3ae516b5`である。
+- LIFF IDは`2010452980-ng2A6Rna`で、公開LIFF URLから確認できるendpointは現行Worker
+  rootである。
+- LINE APIで確認したdefault rich menuは、記録どおりv13
+  (`richmenu-2a48f46d9d89eb5a68bee02c530d55e2`)である。
+- 公開中のプライバシーポリシーには、3回答・タグ・操作時刻、利用目的、90日、unfollow後
+  30日の保持方針がすでに反映されている。
+- オンボーディング用の別Pages projectは存在せず、`apps/liff`だけをbuildしても現行LIFF
+  endpointへは配信されない。
+
+推論:
+
+- 現行Workerのdeploy時刻はcommit `9c145f8`の作成直後であり、現在の本番コードは
+  `b423e6a`と`9c145f8`を含む可能性が高い。Workerのversion metadataだけではGit SHAを
+  直接証明できないため、この2 commitを新branchへ明示的にmergeして退行を防いだ。
+
+未確認:
+
+- LINE Developers管理画面のscope表示は外部ログインが必要で未確認である。初回は
+  `chat_message.write`を追加せず、openidのID tokenをWorker側で検証し、CTAは失敗時に
+  コピーへ戻すため、管理画面の読み取りを公開の必須条件にはしない。
 
 ## 2. 作業場所と基準
 
@@ -32,6 +68,8 @@ APIは404で閉じ、リマインダーも動かない。
 - 専用worktree:
   `/Users/Inaryo/Documents/SATOYAMA AI BASE｜Content & Research Lab/worktrees/line-harness-satoyama-onboarding`
 - 専用worktreeは`origin/main`から分離し、元checkoutの既存差分には触れていない。
+- 本番退行を避けるため、現行本番に含まれると判断した`b423e6a`と`9c145f8`を専用branchへ
+  mergeした。元checkoutのbranchや未コミット差分は変更していない。
 
 ## 3. 実装した体験
 
@@ -190,43 +228,48 @@ DBの事前claimと送信直前の再読込で縮小しているが、外部送�
 
 ## 8. 本番前に必要な設定
 
-次はコード上の設定項目であり、今回は値の設定や外部画面の変更を行っていない。
+本番初回公開では次の値を採用する。設定はWorker secretとして保持し、repositoryへ値を
+コミットしない。
 
 ### Worker
 
 ```text
-SATOYAMA_ONBOARDING_ENABLED=true
-SATOYAMA_ONBOARDING_ACCOUNT_ID=<SATOYAMAのline_accounts.id>
+SATOYAMA_ONBOARDING_ENABLED=false  # code deployとcanary中。確認後だけtrue
+SATOYAMA_ONBOARDING_ACCOUNT_ID=c8e69a14-b590-4ce0-8910-fb2b3ae516b5
 SATOYAMA_ONBOARDING_REMINDER_ENABLED=false
-SATOYAMA_ONBOARDING_RETENTION_ENABLED=false
-SATOYAMA_ONBOARDING_ORIGIN=https://<LIFFを配信するorigin>
+SATOYAMA_ONBOARDING_RETENTION_ENABLED=true
 ```
 
-同一originでLIFFを配信する場合、`SATOYAMA_ONBOARDING_ORIGIN`は不要。最初の本番確認では
-リマインダーを`false`のままにする。RetentionはmigrationとD1バックアップ確認後に
-`true`へ切り替え、削除対象件数を確認してから質問導線を有効化する。
+LIFF画面とAPIは同じWorker originで配信するため、`SATOYAMA_ONBOARDING_ORIGIN`は設定しない。
+リマインダーは初回公開後も`false`のままにする。Retentionはmigration、Time Travel復元点、
+削除対象件数を確認した後に`true`とし、featureが`false`の間は処理対象account自体を解決
+できないため動かない。
 
-### LIFF build / LINE Developers
+### LIFF配信 / LINE Developers
 
-- 別origin構成では`VITE_API_BASE`にWorker originを設定する。
-- 必要なら`VITE_DEFAULT_LIFF_ID`を設定する。通常はLIFF URLの`liffId`を使う。
-- LIFF endpoint URLに`/onboarding/satoyama`を到達可能な形で登録する。
+- 現行のLIFF endpointはWorker rootのまま変更しない。
+- LINEがchild pathを`liff.state`に入れてrootを開いた場合と、直接
+  `/onboarding/satoyama`を開いた場合だけ、専用React画面を遅延読込する。
+- 既存の友だち追加、予約、フォームの分岐は従来のentry pointを通り、専用画面を読まない。
+- 直接pathではWorkerがroot LIFF shellを200で返す。`/index.html`へのredirectでpathを
+  失わないよう、asset rootを内部取得する。
 - IDトークン検証には`openid`が必要。
 - このオンボーディング実装はprofile情報を取得しないため、`profile`は不要。
-- CTAからLINEトークへ文面を入れるには`chat_message.write`が必要。
+- 初回公開では`chat_message.write`を追加しない。既存scopeで明示送信が成立しない場合は
+  相談文をコピーする。
 - 友だち追加直後メッセージ、または明示した導線から次の形式で開く。
   `https://liff.line.me/{LIFF_ID}/onboarding/satoyama?liffId={LIFF_ID}`
 
-LINE Developers、LINE公式アカウント、リッチメニューの実機状態は今回変更・確認していない。
-記録上のリッチメニューv13と実機の一致も未確認である。
+LINE APIでv13とLIFF IDは確認した。LINE Developers管理画面のscope表示は未確認として
+分離する。v13の6ボタンを初回公開で別用途へ上書きせず、入口は明示ボタンとして追加する。
 
 ## 9. 検証記録
 
 ### 自動検証
 
-- Worker全テスト: 59 files / 720 tests
+- Worker全テスト: 60 files / 732 tests
 - DB全テスト: 3 files / 16 tests
-- LIFF送信・再送テスト: 2 files / 6 tests
+- LIFF全テスト: 3 files / 10 tests
 - DB bootstrap生成差分チェック
 - DB TypeScript typecheck
 - Worker TypeScript typecheck
@@ -242,6 +285,9 @@ LINE Developers、LINE公式アカウント、リッチメニューの実機状�
 LIFFでは、同じ回答の再試行は同じkeyを使い、回答を変えた時は新しいkeyになること、429で
 技術用語を使わない案内を表示すること、`chat_message.write`がない場合に相談文をコピーへ
 退避することを確認した。
+Worker統合では、直接pathと`liff.state`の両方を検出し、別originの`liff.state`を無視する
+こと、直接pathでLIFF shellをredirectなしに返すこと、未ログイン時はログイン開始後に画面を
+描画しないこと、ID tokenがない場合はfail-closedになることを追加確認した。
 
 Worker buildには既存のdynamic/static import警告が出るが、build自体は成功した。オンボーディング
 由来の型エラー、テスト失敗、build失敗はない。
@@ -280,9 +326,9 @@ LINE側の友だち追加メッセージやリッチメニューに導線を追�
 
 ## 11. サイト・プライバシーポリシー側の別作業
 
-元checkout `/Users/Inaryo/satoyama-ai-base`は編集せず、別worktree
-`worktrees/satoyama-site-source-of-truth`のbranch `feat/satoyama-site-source-of-truth`で、
-プライバシーポリシーの追記案を実装・検証した。公開サイト、本番、元checkoutには未反映である。
+元checkout `/Users/Inaryo/satoyama-ai-base`は今回編集していない。公開中の
+`https://www.satoyama-ai-base.com/legal/privacy`を2026年7月27日に再確認し、
+オンボーディングに必要な記載が反映済みであることを確認した。
 
 同案には次を反映した。
 
@@ -293,28 +339,25 @@ LINE側の友だち追加メッセージやリッチメニューに導線を追�
 - 開示、訂正、削除、配信停止の連絡方法
 - 回答が任意で、未回答でも基本機能を使えること
 
-具体的な保存日数とunfollow後の自動削除は実装済みで、サイト側の公開文にも反映した。
-ただし、公開前に本番D1バックアップとRetention flagの有効化確認が必要である。
-サイト側は49 files / 732 tests、型検査、production build、PC・スマホ表示を確認済み。
+具体的な保存日数とunfollow後の自動削除はコードと公開文で一致している。公開前に本番D1の
+Time Travel復元点、047適用結果、Retention flag、有効化直前の削除対象件数を確認する。
 
-## 12. Ryoの判断が必要な項目
+## 12. 初回公開で確定した判断
 
-1. 共通特典、課題別シート、CTA文20通りを初期公開文として最終承認するか。
-2. 初回は`chat_message.write`を付けず、送信失敗時もコピーへ退避する方針でよいか。
-3. 友だち追加直後に強制表示せず、メッセージ内の明示ボタンから開く方針でよいか。
-4. 48時間後案内は停止したまま少人数公開し、結果を見て別判断する方針でよいか。
-5. プライバシーポリシーをLINE導線より先に公開する日。
-6. 記録上v13のリッチメニューと実機の差を確認し、どのボタンからこの画面へ接続するか。
-7. 本番反映順を、migration → code（flag off）→ LIFF → Retention確認 → 少人数確認 → feature on →
-   reminder onとするか。
+1. 共通特典、課題別シート、CTA文20通りを検証版として開始する。
+2. `chat_message.write`は追加せず、送信できない場合はコピーへ退避する。
+3. 友だち追加直後に強制表示せず、本人が押す明示ボタンから開始する。
+4. 48時間後案内と一斉・自動pushは停止する。
+5. 生の自由会話をこの機能では収集しない。
+6. v13の既存6ボタンを意味の違う導線へ上書きしない。
+7. migration → code feature OFF → canary → retention確認 → feature ONの順で進める。
 
-## 13. 今回行っていないこと
+## 13. 本番作業でも行わないこと
 
-- merge
-- LINE公式アカウント、LINE Developers、LINE Harness本番への変更
-- LINE Harness用Cloudflare、D1本番、LIFF Pagesへの変更・送信・deploy
-- 実ユーザーへのメッセージ送信
+- 一斉配信、自動push、既存友だちへのメッセージ送信
+- `chat_message.write`の追加
+- 48時間後リマインダーの有効化
+- LINE Developers scopeの拡張
+- v13の既存ボタンを説明と異なる機能へ付け替えること
 - 元checkout `/Users/Inaryo/satoyama-ai-base`の編集
-- サイト用隔離branchの公開・deploy
-- 現行リッチメニューとLINE実機の確認
-- 本番migration適用
+- オンボーディング専用Pages projectの新設

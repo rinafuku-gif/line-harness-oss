@@ -11,7 +11,7 @@ import './index.css';
       import.meta.env.DEV &&
       window.location.pathname === '/onboarding/satoyama' &&
       new URLSearchParams(window.location.search).get('preview') === '1';
-    if (!preview) await initLiff();
+    if (!preview && !(await initLiff())) return;
     createRoot(document.getElementById('root')!).render(
       <StrictMode>
         <BrowserRouter>

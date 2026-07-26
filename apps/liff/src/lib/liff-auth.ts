@@ -14,7 +14,7 @@ function liffIdFromState(url: URL): string | null {
   }
 }
 
-export async function initLiff(): Promise<void> {
+export async function initLiff(): Promise<boolean> {
   const url = new URL(window.location.href);
   // On the first LIFF redirect, additional path/query information can still
   // be packed into liff.state. Read the public liffId from there only for SDK
@@ -30,10 +30,14 @@ export async function initLiff(): Promise<void> {
   await liff.init({ liffId });
   if (!liff.isLoggedIn()) {
     liff.login();
-    return;
+    return false;
   }
   // id_token は Worker 側で LINE Login verify API を叩いて caller を確定するために使う。
   _idToken = liff.getIDToken();
+  if (!_idToken) {
+    throw new Error('LINEの本人確認情報を取得できませんでした。LINEアプリから開き直してください。');
+  }
+  return true;
 }
 
 export function getLiffId(): string {

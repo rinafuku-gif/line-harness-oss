@@ -20,7 +20,7 @@ vi.mock('@line-crm/db', () => ({
   recoverStuckDeliveries: vi.fn(),
 }));
 
-import { notFoundHandler, type Env } from './index.js';
+import { notFoundHandler, serveLiffIndex, type Env } from './index.js';
 
 function makeApp(env: Partial<Env['Bindings']>) {
   const app = new Hono<Env>();
@@ -66,5 +66,40 @@ describe('notFoundHandler — root / request', () => {
     const res = await fetchApp('/api/does-not-exist');
     expect(res.status).toBe(404);
     expect(assets.fetch).not.toHaveBeenCalled();
+  });
+});
+
+describe('serveLiffIndex — dedicated SATOYAMA path', () => {
+  function makeOnboardingApp(env: Partial<Env['Bindings']>) {
+    const app = new Hono<Env>();
+    app.get('/onboarding/satoyama', serveLiffIndex);
+    return app.fetch(
+      new Request('https://worker.example.com/onboarding/satoyama?liffId=known'),
+      env as Env['Bindings'],
+    );
+  }
+
+  it('serves the root LIFF shell without changing the configured endpoint', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response('<div id="app"></div>', {
+        status: 200,
+        headers: { 'content-type': 'text/html' },
+      }),
+    );
+    const res = await makeOnboardingApp({
+      DB: {} as D1Database,
+      ASSETS: { fetch: fetchMock } as unknown as Fetcher,
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain('id="app"');
+    expect(fetchMock).toHaveBeenCalledOnce();
+    const requested = fetchMock.mock.calls[0][0] as Request;
+    expect(new URL(requested.url).pathname).toBe('/');
+  });
+
+  it('fails closed when the assets binding is unavailable', async () => {
+    const res = await makeOnboardingApp({ DB: {} as D1Database });
+    expect(res.status).toBe(404);
   });
 });
