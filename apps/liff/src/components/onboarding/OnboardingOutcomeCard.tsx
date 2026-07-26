@@ -42,7 +42,7 @@ export function OnboardingOutcomeCard({
           {sending ? '準備しています…' : outcome.cta.label}
         </button>
         <p className="cta-note">
-          このボタンを押した時だけ、上の内容をLINEトークへ送ります。初回適合確認の予約は自動では始まりません。
+          このボタンを押した時だけ、上の相談文をLINEトークへ送るか、コピーします。無料相談の予約は自動では始まりません。
         </p>
         {actionMessage ? (
           <p className="action-message" role="status">
