@@ -94,6 +94,10 @@ vi.mock('../services/chatBackend.js', async () => {
     // 追加）のため実装をそのまま使う。モックすると「常に空にフォールバックしない」誤検知の
     // テストになってしまう。
     resolveQuickReplyOptions: actual.resolveQuickReplyOptions,
+    // QUICK_REPLY_LABEL_MAX_LENGTH は定数（2026-07-18 名前クイックリプライ追加で
+    // webhook.ts が参照するようになった）。実値を使わないとトリミング境界のテストが
+    // 意味をなさないため、他の決定論的エクスポートと同様に実装をそのまま使う。
+    QUICK_REPLY_LABEL_MAX_LENGTH: actual.QUICK_REPLY_LABEL_MAX_LENGTH,
   };
 });
 
@@ -170,6 +174,12 @@ beforeEach(() => {
   vi.mocked(parseDayPostbackData).mockReturnValue(null);
   vi.mocked(groupSlotsByJstDay).mockReturnValue([]);
   vi.mocked(filterSlotsByJstDay).mockReturnValue([]);
+
+  // lineClientMocks.getProfile も同じ理由（vi.clearAllMocks()は実装を消さない）で
+  // 前のテストの mockResolvedValue が漏れる。名前クイックリプライ(2026-07-18追加)の
+  // テストが「プロフィール取得成功/失敗」を明示的に指定できるよう、デフォルトで
+  // 未解決の空実装に戻す（各テストが必要に応じて上書きする）。
+  lineClientMocks.getProfile.mockReset();
 });
 
 describe('POST /webhook — DoS defenses (#104)', () => {
@@ -914,13 +924,12 @@ describe('POST /webhook — chat parity (external chat backend, Ryo限定テス�
     expect(upsertChatBookingSession).not.toHaveBeenCalled();
   });
 
-  test('gate open + backend throws (timeout/network): falls back to existing Gemini flow, replyToken still gets consumed via fallback text', async () => {
+  test('gate open + backend throws (timeout/network): sends the generic retry fallback + default quick replies, does NOT fall through to the legacy free-form Gemini flow (2026-07-17 21:42 JST 実機事故の再発防止)', async () => {
     vi.mocked(isChatParityEnabled).mockReturnValue(true);
     vi.mocked(invokeChatBackend).mockRejectedValue(new Error('chat backend error: 500 Internal Server Error'));
     vi.mocked(isConsultationRateLimited).mockResolvedValue(false);
-    vi.mocked(invokeLLM).mockResolvedValue('Gemini fallback reply');
-    vi.mocked(buildMessage).mockReturnValue({ type: 'text', text: 'Gemini fallback reply' });
-    vi.mocked(messageToLogPayload).mockReturnValue({ messageType: 'text', content: 'Gemini fallback reply' });
+    vi.mocked(buildMessage).mockReturnValue({ type: 'text', text: CONSULTATION_FALLBACK_MESSAGE });
+    vi.mocked(messageToLogPayload).mockReturnValue({ messageType: 'text', content: CONSULTATION_FALLBACK_MESSAGE });
 
     const { res, replyToken } = await postParity({
       GEMINI_API_KEY: 'test-gemini-key',
@@ -931,8 +940,22 @@ describe('POST /webhook — chat parity (external chat backend, Ryo限定テス�
 
     expect(res.status).toBe(200);
     expect(invokeChatBackend).toHaveBeenCalledTimes(1);
-    expect(invokeLLM).toHaveBeenCalledTimes(1);
-    expect(lineClientMocks.replyMessage).toHaveBeenCalledWith(replyToken, [{ type: 'text', text: 'Gemini fallback reply' }]);
+    // 事業固有のトーンを持たない汎用Gemini経路（buildConsultationPrompt/invokeLLM）には
+    // 一切流れない。line-harness-ossはOSS公開forkであり事業固有の文面を持たない設計のため。
+    expect(invokeLLM).not.toHaveBeenCalled();
+    expect(lineClientMocks.replyMessage).toHaveBeenCalledWith(replyToken, [
+      {
+        type: 'text',
+        text: CONSULTATION_FALLBACK_MESSAGE,
+        quickReply: {
+          items: [
+            { type: 'action', action: { type: 'message', label: 'もっと詳しく', text: 'もっと詳しく' } },
+            { type: 'action', action: { type: 'message', label: '別のことを相談する', text: '別のことを相談する' } },
+            { type: 'action', action: { type: 'message', label: '無料相談を予約する', text: '無料相談を予約する' } },
+          ],
+        },
+      },
+    ]);
   });
 
   test('gate open + backend returns quickReplies: attaches a LINE quick reply to the text message (2026-07-17追加)', async () => {
@@ -1184,6 +1207,115 @@ describe('POST /webhook — chat booking flow (会話中のセッション)', ()
     ]);
     expect(invokeLLM).not.toHaveBeenCalled();
     expect(invokeChatBackend).not.toHaveBeenCalled();
+  });
+
+  test('awaiting_name → awaiting_email transition: attaches a "メールなしで進む" one-tap quick reply (2026-07-18追加)', async () => {
+    vi.mocked(getChatBookingSession).mockResolvedValue({
+      friendId: 'friend-booking-1',
+      state: 'awaiting_name',
+      selectedStart: '2026-08-01T01:00:00.000Z',
+      selectedEnd: '2026-08-01T01:30:00.000Z',
+      name: null,
+      updatedAt: '2026-07-01T12:00:00.000',
+    });
+
+    const { replyToken } = await postBookingStep('山田太郎');
+
+    expect(lineClientMocks.replyMessage).toHaveBeenCalledWith(replyToken, [
+      expect.objectContaining({
+        type: 'text',
+        quickReply: {
+          items: [
+            {
+              type: 'action',
+              action: { type: 'message', label: 'メールなしで進む', text: 'なし' },
+            },
+          ],
+        },
+      }),
+    ]);
+  });
+
+  test('awaiting_name: LINEプロフィール取得に成功していれば表示名ワンタップボタンを添える(2026-07-18追加)', async () => {
+    vi.mocked(getChatBookingSession).mockResolvedValue({
+      friendId: 'friend-booking-1',
+      state: 'awaiting_name',
+      selectedStart: '2026-08-01T01:00:00.000Z',
+      selectedEnd: '2026-08-01T01:30:00.000Z',
+      name: null,
+      updatedAt: '2026-07-01T12:00:00.000',
+    });
+    lineClientMocks.getProfile.mockResolvedValue({
+      userId: 'U-booking-1',
+      displayName: '山田太郎',
+    });
+
+    // 空欄はバリデーション不合格 → 再度お名前を尋ねるメッセージにも同じボタンが付く。
+    const { replyToken } = await postBookingStep('   ');
+
+    expect(lineClientMocks.getProfile).toHaveBeenCalledWith('U-booking-1');
+    expect(lineClientMocks.replyMessage).toHaveBeenCalledWith(replyToken, [
+      expect.objectContaining({
+        type: 'text',
+        quickReply: {
+          items: [
+            {
+              type: 'action',
+              action: { type: 'message', label: '山田太郎', text: '山田太郎' },
+            },
+          ],
+        },
+      }),
+    ]);
+  });
+
+  test('awaiting_name: 長い表示名はボタンのラベルだけ20文字に切り詰め、タップ送信文言はフル表示名のまま(2026-07-18追加)', async () => {
+    vi.mocked(getChatBookingSession).mockResolvedValue({
+      friendId: 'friend-booking-1',
+      state: 'awaiting_name',
+      selectedStart: '2026-08-01T01:00:00.000Z',
+      selectedEnd: '2026-08-01T01:30:00.000Z',
+      name: null,
+      updatedAt: '2026-07-01T12:00:00.000',
+    });
+    const longName = 'あ'.repeat(30);
+    lineClientMocks.getProfile.mockResolvedValue({ userId: 'U-booking-1', displayName: longName });
+
+    const { replyToken } = await postBookingStep('   ');
+
+    expect(lineClientMocks.replyMessage).toHaveBeenCalledWith(replyToken, [
+      expect.objectContaining({
+        quickReply: {
+          items: [
+            {
+              type: 'action',
+              action: { type: 'message', label: 'あ'.repeat(20), text: longName },
+            },
+          ],
+        },
+      }),
+    ]);
+  });
+
+  test('awaiting_name: LINEプロフィール取得が失敗してもフェイルオープンし、自由入力のみのメッセージで続行する(2026-07-18追加)', async () => {
+    vi.mocked(getChatBookingSession).mockResolvedValue({
+      friendId: 'friend-booking-1',
+      state: 'awaiting_name',
+      selectedStart: '2026-08-01T01:00:00.000Z',
+      selectedEnd: '2026-08-01T01:30:00.000Z',
+      name: null,
+      updatedAt: '2026-07-01T12:00:00.000',
+    });
+    lineClientMocks.getProfile.mockRejectedValue(new Error('LINE API error: 500'));
+
+    const { res, replyToken } = await postBookingStep('   ');
+
+    expect(res.status).toBe(200);
+    expect(lineClientMocks.replyMessage).toHaveBeenCalledWith(replyToken, [
+      expect.objectContaining({ type: 'text', text: 'お名前を1〜255文字で教えてください。' }),
+    ]);
+    const [sentMessage] = vi.mocked(lineClientMocks.replyMessage).mock.calls[0][1] as Array<Record<string, unknown>>;
+    expect(sentMessage.quickReply).toBeUndefined();
   });
 
   test('awaiting_name: rejects an empty name and re-prompts without advancing the session', async () => {
@@ -1542,6 +1674,44 @@ describe('POST /webhook — chat booking slot selection (postback)', () => {
     expect(lineClientMocks.replyMessage).toHaveBeenCalledWith(replyToken, [expect.objectContaining({ type: 'text' })]);
   });
 
+  test('slot postback with no existing session (fresh flow): attaches a LINE表示名 one-tap quick reply when profile lookup succeeds (2026-07-18追加)', async () => {
+    vi.mocked(parseSlotPostbackData).mockReturnValue({
+      start: '2026-08-01T01:00:00.000Z',
+      end: '2026-08-01T01:30:00.000Z',
+    });
+    vi.mocked(getChatBookingSession).mockResolvedValue(null);
+    lineClientMocks.getProfile.mockResolvedValue({ userId: 'U-slot-1', displayName: '鈴木花子' });
+
+    const { replyToken } = await postSlotSelection('CHATBOOK_SLOT:2026-08-01T01:00:00.000Z|2026-08-01T01:30:00.000Z');
+
+    expect(lineClientMocks.getProfile).toHaveBeenCalledWith('U-slot-1');
+    expect(lineClientMocks.replyMessage).toHaveBeenCalledWith(replyToken, [
+      expect.objectContaining({
+        type: 'text',
+        quickReply: {
+          items: [
+            { type: 'action', action: { type: 'message', label: '鈴木花子', text: '鈴木花子' } },
+          ],
+        },
+      }),
+    ]);
+  });
+
+  test('slot postback with no existing session (fresh flow): fails open (no quick reply) when profile lookup fails (2026-07-18追加)', async () => {
+    vi.mocked(parseSlotPostbackData).mockReturnValue({
+      start: '2026-08-01T01:00:00.000Z',
+      end: '2026-08-01T01:30:00.000Z',
+    });
+    vi.mocked(getChatBookingSession).mockResolvedValue(null);
+    lineClientMocks.getProfile.mockRejectedValue(new Error('LINE API error: 500'));
+
+    const { replyToken } = await postSlotSelection('CHATBOOK_SLOT:2026-08-01T01:00:00.000Z|2026-08-01T01:30:00.000Z');
+
+    expect(lineClientMocks.replyMessage).toHaveBeenCalledWith(replyToken, [expect.objectContaining({ type: 'text' })]);
+    const [sentMessage] = vi.mocked(lineClientMocks.replyMessage).mock.calls[0][1] as Array<Record<string, unknown>>;
+    expect(sentMessage.quickReply).toBeUndefined();
+  });
+
   test('slot postback with a session that already has a name (409 re-selection): skips straight to email', async () => {
     vi.mocked(parseSlotPostbackData).mockReturnValue({
       start: '2026-08-02T01:00:00.000Z',
@@ -1563,6 +1733,34 @@ describe('POST /webhook — chat booking slot selection (postback)', () => {
       selectedStart: '2026-08-02T01:00:00.000Z',
       selectedEnd: '2026-08-02T01:30:00.000Z',
     });
+  });
+
+  test('slot postback with a session that already has a name (409 re-selection): attaches a "メールなしで進む" one-tap quick reply (2026-07-18追加)', async () => {
+    vi.mocked(parseSlotPostbackData).mockReturnValue({
+      start: '2026-08-02T01:00:00.000Z',
+      end: '2026-08-02T01:30:00.000Z',
+    });
+    vi.mocked(getChatBookingSession).mockResolvedValue({
+      friendId: 'friend-slot-1',
+      state: 'awaiting_slot_selection',
+      selectedStart: null,
+      selectedEnd: null,
+      name: '山田太郎',
+      updatedAt: '2026-07-01T12:00:00.000',
+    });
+
+    const { replyToken } = await postSlotSelection('CHATBOOK_SLOT:2026-08-02T01:00:00.000Z|2026-08-02T01:30:00.000Z');
+
+    expect(lineClientMocks.replyMessage).toHaveBeenCalledWith(replyToken, [
+      expect.objectContaining({
+        type: 'text',
+        quickReply: {
+          items: [
+            { type: 'action', action: { type: 'message', label: 'メールなしで進む', text: 'なし' } },
+          ],
+        },
+      }),
+    ]);
   });
 });
 

@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import { verifySignature, LineClient, quickReply, withQuickReply } from '@line-crm/line-sdk';
-import type { WebhookRequestBody, WebhookEvent, TextEventMessage, Message } from '@line-crm/line-sdk';
+import type { WebhookRequestBody, WebhookEvent, TextEventMessage, Message, QuickReply } from '@line-crm/line-sdk';
 import { createStickerMessageContent } from '@line-crm/shared';
 import {
   upsertFriend,
@@ -43,6 +43,7 @@ import {
   buildQuickReplyItems,
   isExplicitBookingIntent,
   resolveQuickReplyOptions,
+  QUICK_REPLY_LABEL_MAX_LENGTH,
   type BookingSlot,
 } from '../services/chatBackend.js';
 import {
@@ -161,6 +162,56 @@ async function sendReplyAndLog(
   }
 }
 
+/**
+ * 名前入力ステップのワンタップ化（2026-07-18追加）。
+ *
+ * 背景（Ryo実機の指摘）: 予約フロー中にリッチメニューが開いたままだと入力欄が
+ * 隠れてタイピングに詰まる（LINE仕様: メニューは開いたままタップ後も残る）。
+ * 友だち登録時点で取得済みの表示名を、LINEプロフィールAPIから改めて取得し直し
+ * （その場でユーザーが名前を変えている可能性を考慮し、DBキャッシュではなく最新値を
+ * 都度取る）、「タップするだけで送信される」クイックリプライボタンを1件だけ添える。
+ * 手入力の経路は一切変更しない（ボタンはタップ時にボタンのラベル文字列がそのまま
+ * ユーザー発言として送信されるだけで、既存の awaiting_name ステップの文字数検証を
+ * そのまま通る）。
+ *
+ * フェイルオープン: プロフィール取得に失敗した場合・displayNameが空の場合は
+ * undefined を返す。呼び出し元はその場合クイックリプライを添えず、従来通り
+ * 自由入力のみのメッセージで送る（予約フロー自体を止めない）。
+ */
+async function buildNameQuickReplyBestEffort(
+  lineClient: LineClient,
+  lineUserId: string,
+): Promise<QuickReply | undefined> {
+  try {
+    const profile = await lineClient.getProfile(lineUserId);
+    const displayName = profile.displayName?.trim();
+    if (!displayName) return undefined;
+    const label =
+      displayName.length > QUICK_REPLY_LABEL_MAX_LENGTH
+        ? displayName.slice(0, QUICK_REPLY_LABEL_MAX_LENGTH)
+        : displayName;
+    return quickReply([{ type: 'action', action: { type: 'message', label, text: displayName } }]);
+  } catch (err) {
+    console.error('[webhook] failed to fetch profile for name quick reply (fail-open: free text only)', err);
+    return undefined;
+  }
+}
+
+/**
+ * メール入力ステップのワンタップ化（2026-07-18追加）。メールは既にオプショナル
+ * （「なし」等 CHAT_BOOKING_NO_EMAIL_KEYWORDS を送ると省略できる）なので、その先頭
+ * 語彙をそのままタップ送信文言にしたボタンを添えるだけで済む。新しい語彙・分岐は
+ * 増やさない（＝必須項目化/省略可能項目の追加は行わない。仕様は不変）。
+ */
+function buildSkipEmailQuickReply(): QuickReply {
+  return quickReply([
+    {
+      type: 'action',
+      action: { type: 'message', label: 'メールなしで進む', text: CHAT_BOOKING_NO_EMAIL_KEYWORDS[0] },
+    },
+  ]);
+}
+
 /** 日時選択(postback)を受けた直後の処理。氏名が既知(409再選択等)ならメール収集へ直行する。 */
 async function handleChatBookingSlotSelection(
   db: D1Database,
@@ -178,9 +229,12 @@ async function handleChatBookingSlotSelection(
       selectedStart: slot.start,
       selectedEnd: slot.end,
     });
-    const msg = buildMessage(
-      'text',
-      `${label} で承ります。\nメールアドレスは分かりますか？（確認メールをお送りします。なければ「なし」とお送りください）`,
+    const msg = withQuickReply(
+      buildMessage(
+        'text',
+        `${label} で承ります。\nメールアドレスは分かりますか？（確認メールをお送りします。なければ「なし」とお送りください）`,
+      ),
+      buildSkipEmailQuickReply(),
     );
     await sendReplyAndLog(lineClient, db, friend.id, replyToken, [msg], 'chat_booking_flow');
     return;
@@ -191,8 +245,10 @@ async function handleChatBookingSlotSelection(
     selectedStart: slot.start,
     selectedEnd: slot.end,
   });
-  const msg = buildMessage('text', `${label} で承ります。\nお名前を教えてください。`);
-  await sendReplyAndLog(lineClient, db, friend.id, replyToken, [msg], 'chat_booking_flow');
+  const nameMsg = buildMessage('text', `${label} で承ります。\nお名前を教えてください。`);
+  const nameQuickReply = await buildNameQuickReplyBestEffort(lineClient, friend.line_user_id);
+  const finalNameMsg = nameQuickReply ? withQuickReply(nameMsg, nameQuickReply) : nameMsg;
+  await sendReplyAndLog(lineClient, db, friend.id, replyToken, [finalNameMsg], 'chat_booking_flow');
 }
 
 /**
@@ -401,14 +457,19 @@ async function handleChatBookingTextStep(
 
   if (session.state === 'awaiting_name') {
     if (trimmed.length < 1 || trimmed.length > 255) {
-      const msg = buildMessage('text', 'お名前を1〜255文字で教えてください。');
-      await sendReplyAndLog(lineClient, db, friend.id, replyToken, [msg], 'chat_booking_flow');
+      const retryMsg = buildMessage('text', 'お名前を1〜255文字で教えてください。');
+      const nameQuickReply = await buildNameQuickReplyBestEffort(lineClient, friend.line_user_id);
+      const finalRetryMsg = nameQuickReply ? withQuickReply(retryMsg, nameQuickReply) : retryMsg;
+      await sendReplyAndLog(lineClient, db, friend.id, replyToken, [finalRetryMsg], 'chat_booking_flow');
       return;
     }
     await upsertChatBookingSession(db, friend.id, { state: 'awaiting_email', name: trimmed });
-    const msg = buildMessage(
-      'text',
-      'メールアドレスは分かりますか？（確認メールをお送りします。なければ「なし」とお送りください）',
+    const msg = withQuickReply(
+      buildMessage(
+        'text',
+        'メールアドレスは分かりますか？（確認メールをお送りします。なければ「なし」とお送りください）',
+      ),
+      buildSkipEmailQuickReply(),
     );
     await sendReplyAndLog(lineClient, db, friend.id, replyToken, [msg], 'chat_booking_flow');
     return;
@@ -1309,9 +1370,36 @@ async function handleEvent(
             }
           } catch (err) {
             console.error(
-              `[webhook] chat parity backend failed after ${Date.now() - parityStart}ms, falling back to existing consultation`,
+              `[webhook] chat parity backend failed after ${Date.now() - parityStart}ms, sending generic retry fallback`,
               err,
             );
+
+            // 2026-07-17 21:42 JST 実機事故の再発防止。
+            // parity対象ユーザーでバックエンド呼び出しが失敗/タイムアウトした際、
+            // 従来は下の「相談窓口 AI 一次応答 (Gemini)」（buildConsultationPrompt）に
+            // そのまま流れ込んでいた。あのプロンプトはOSS汎用の「受付窓口」トーン
+            // 固定文（「担当者が確認のうえ改めてご連絡します」という趣旨で伝える指示）
+            // を持ち、事業固有のポリシー（担当者への取り次ぎを匂わせない等）と衝突しうる
+            // 上、テキストのみでクイックリプライが付かない（このリポジトリは事業固有の
+            // 文面を持たない設計＝上記ファイル冒頭コメント参照。なので新たに事業文言を
+            // ここに書き足すのではなく、既存の汎用フォールバック文
+            // (CONSULTATION_FALLBACK_MESSAGE) を使い、構造的にクイックリプライだけ
+            // 必ず添付する）。
+            try {
+              const fallbackMsg = withQuickReply(
+                buildMessage('text', CONSULTATION_FALLBACK_MESSAGE),
+                quickReply(buildQuickReplyItems(resolveQuickReplyOptions(undefined, false))),
+              );
+              await lineClient.replyMessage(event.replyToken, [fallbackMsg]);
+              replyTokenConsumed = true;
+              handledByChatParity = true;
+
+              const { messageToLogPayload: logPayloadParityFallback } = await import('../services/step-delivery.js');
+              await logOutgoingMessage(db, friend.id, logPayloadParityFallback(fallbackMsg), 'ai_consultation_fallback');
+            } catch (fallbackErr) {
+              // 送信自体も失敗した場合のみ、既存の安全網（下の汎用Geminiフロー）に委ねる。
+              console.error('[webhook] chat parity fallback reply also failed, falling through to legacy consultation', fallbackErr);
+            }
           }
         }
       }
