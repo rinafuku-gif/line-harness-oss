@@ -1,7 +1,7 @@
 # SATOYAMA LINE登録直後オンボーディング 実装記録
 
 確認日: 2026年7月27日
-状態: 隔離branchで本番直前の再監査・統合検証済み。本番反映作業中
+状態: D1 migration 047、Worker配置、feature有効化まで完了。一般向け入口の接続とテスト用LINEユーザーでの実機確認は未実施
 
 ## 1. 結論
 
@@ -12,8 +12,9 @@ SATOYAMA AI BASE専用のLIFFオンボーディングを、既存の汎用フォ
 主分岐は課題5系統、言い方とCTAは立場4種類、具体例は領域5種類で変える。立場・課題・
 領域の14タグは独立して保持し、再回答時はこの14タグだけを置き換える。
 
-実装は初期状態で停止している。SATOYAMAの対象account IDと有効化flagを明示しない限り、
-APIは404で閉じ、リマインダーも動かない。
+本番ではSATOYAMAの対象account IDを固定し、オンボーディング本体を有効化した。
+48時間後の再案内は停止したままで、一斉送信・自動push・既存友だちへの送信は行っていない。
+現行リッチメニューv13も変更していないため、一般利用者が意図せず画面へ誘導される状態ではない。
 
 ### 2026年7月27日の本番再監査で分かったこと
 
@@ -24,14 +25,24 @@ APIは404で閉じ、リマインダーも動かない。
 
 - 現行Workerは`https://satoyama.r-inafuku.workers.dev`で、D1は`satoyama`
   (`a45e126e-4f05-49db-ada2-fb9767fb892d`)である。
-- 現行Worker versionは`a7fd8991-cdec-4002-b92a-fe74ac549ffd`である。
-- 本番D1には`_migrations`管理表がなく、047の2 tableもまだ存在しない。
-- 047適用前のD1 Time Travel bookmarkとして
-  `000009e3-00000112-000050b4-656da4086c9151e1c4cb4c696296fae7`を記録した。
+- 反映前のWorker versionは`a7fd8991-cdec-4002-b92a-fe74ac549ffd`、feature有効化後の
+  Worker versionは`3626ec6f-ebac-40fe-bc16-a3ac79716003`である。
+- 本番D1へmigration 047だけを適用し、2 tableと4 indexを作成した。適用後の
+  `satoyama_onboarding_states`と`satoyama_onboarding_answer_events`はいずれも0件である。
+- 047適用直前のD1 Time Travel bookmarkとして
+  `000009e3-0000011e-000050b4-38feaf45dfd0865661baf8f7391bf256`、
+  適用後のbookmarkとして
+  `000009e3-00000128-000050b4-28bddb44242ab70c30f83c3121bee23c`を記録した。
+- 本番D1には`_migrations`管理表がない。今回は過去の001〜046を再実行しないため、
+  047のSQLだけを明示適用した。将来GitHub Actionsのmigration自動適用を有効にする前に、
+  現行DBとmigration管理表の整合を別作業で解決する必要がある。
 - LINE公式アカウントは`SATOYAMA AI BASE`、Basic IDは`@969evmpq`、
   Harness account IDは`c8e69a14-b590-4ce0-8910-fb2b3ae516b5`である。
 - LIFF IDは`2010452980-ng2A6Rna`で、公開LIFF URLから確認できるendpointは現行Worker
   rootである。
+- 公開LIFF URLが生成したLINE Login認可URLでは、実効scopeが`openid profile`であり、
+  `chat_message.write`が含まれないことを確認した。オンボーディング実装は`profile`を
+  読み取らない。
 - LINE APIで確認したdefault rich menuは、記録どおりv13
   (`richmenu-2a48f46d9d89eb5a68bee02c530d55e2`)である。
 - 公開中のプライバシーポリシーには、3回答・タグ・操作時刻、利用目的、90日、unfollow後
@@ -47,9 +58,9 @@ APIは404で閉じ、リマインダーも動かない。
 
 未確認:
 
-- LINE Developers管理画面のscope表示は外部ログインが必要で未確認である。初回は
-  `chat_message.write`を追加せず、openidのID tokenをWorker側で検証し、CTAは失敗時に
-  コピーへ戻すため、管理画面の読み取りを公開の必須条件にはしない。
+- LINE Developers管理画面に表示される設定値そのものは外部ログインが必要で未確認である。
+  ただし公開LIFFの実効認可URLでは`openid profile`とendpointを確認した。
+- テスト用LINEユーザーによる3問回答、再回答、スキップ、ブロック・友だち解除は未確認である。
 
 ## 2. 作業場所と基準
 
@@ -226,24 +237,22 @@ DBの事前claimと送信直前の再読込で縮小しているが、外部送�
 初期判断は母数が小さい可能性があるため、個別ユーザーの行動評価ではなく、質問負荷、
 特典の利用、次の一歩の分かりやすさを改善する仮説検証として使う。
 
-## 8. 本番前に必要な設定
+## 8. 本番へ反映した設定
 
-本番初回公開では次の値を採用する。設定はWorker secretとして保持し、repositoryへ値を
-コミットしない。
+次の値をWorker secretとして反映した。値はrepositoryへコミットしていない。
 
 ### Worker
 
 ```text
-SATOYAMA_ONBOARDING_ENABLED=false  # code deployとcanary中。確認後だけtrue
+SATOYAMA_ONBOARDING_ENABLED=true
 SATOYAMA_ONBOARDING_ACCOUNT_ID=c8e69a14-b590-4ce0-8910-fb2b3ae516b5
 SATOYAMA_ONBOARDING_REMINDER_ENABLED=false
 SATOYAMA_ONBOARDING_RETENTION_ENABLED=true
 ```
 
-LIFF画面とAPIは同じWorker originで配信するため、`SATOYAMA_ONBOARDING_ORIGIN`は設定しない。
-リマインダーは初回公開後も`false`のままにする。Retentionはmigration、Time Travel復元点、
-削除対象件数を確認した後に`true`とし、featureが`false`の間は処理対象account自体を解決
-できないため動かない。
+LIFF画面とAPIは同じWorker originで配信するため、`SATOYAMA_ONBOARDING_ORIGIN`は設定して
+いない。リマインダーは`false`のままである。Retentionはmigration、Time Travel復元点、
+削除対象0件を確認した後に`true`へ設定した。
 
 ### LIFF配信 / LINE Developers
 
@@ -260,8 +269,9 @@ LIFF画面とAPIは同じWorker originで配信するため、`SATOYAMA_ONBOARDI
 - 友だち追加直後メッセージ、または明示した導線から次の形式で開く。
   `https://liff.line.me/{LIFF_ID}/onboarding/satoyama?liffId={LIFF_ID}`
 
-LINE APIでv13とLIFF IDは確認した。LINE Developers管理画面のscope表示は未確認として
-分離する。v13の6ボタンを初回公開で別用途へ上書きせず、入口は明示ボタンとして追加する。
+LINE APIでv13とLIFF IDを確認し、公開LIFFのLINE Login認可URLで実効scope
+`openid profile`も確認した。LINE Developers管理画面の表示値は未確認として分離する。
+v13の6ボタンは別用途へ上書きしていない。一般向けの明示ボタンはまだ追加していない。
 
 ## 9. 検証記録
 
@@ -294,7 +304,7 @@ Worker buildには既存のdynamic/static import警告が出るが、build自体
 
 ### 画面確認
 
-ローカルの送信しないpreviewで確認した。
+専用LIFF単体の送信しないpreviewで確認した。
 
 - PC相当: 1440 × 1000、横overflowなし
 - スマホ相当: 390 × 844、横overflowなし
@@ -305,7 +315,10 @@ Worker buildには既存のdynamic/static import警告が出るが、build自体
 - Vite error overlay: なし
 - browser console error: 0件
 
-実機LINE WebViewとLINE Developersのscopeは未確認である。
+Workerへ統合した画面は1280 × 720のブラウザで、直接path、質問順、回答結果、コピーCTA、
+横overflowなし、console error 0件を確認した。統合後の画面を390 × 844と1440 × 1000で
+再取得する操作はブラウザ検証環境の制約で完了していない。単体画面では両サイズを確認済み
+だが、統合後の厳密な2サイズと実機LINE WebViewは未確認として残す。
 
 ## 10. ロールバック
 
@@ -339,8 +352,8 @@ LINE側の友だち追加メッセージやリッチメニューに導線を追�
 - 開示、訂正、削除、配信停止の連絡方法
 - 回答が任意で、未回答でも基本機能を使えること
 
-具体的な保存日数とunfollow後の自動削除はコードと公開文で一致している。公開前に本番D1の
-Time Travel復元点、047適用結果、Retention flag、有効化直前の削除対象件数を確認する。
+具体的な保存日数とunfollow後の自動削除はコードと公開文で一致している。本番D1の
+Time Travel復元点、047適用結果、Retention flag、有効化直前の削除対象0件を確認した。
 
 ## 12. 初回公開で確定した判断
 
@@ -352,7 +365,36 @@ Time Travel復元点、047適用結果、Retention flag、有効化直前の削�
 6. v13の既存6ボタンを意味の違う導線へ上書きしない。
 7. migration → code feature OFF → canary → retention確認 → feature ONの順で進める。
 
-## 13. 本番作業でも行わないこと
+## 13. 本番反映結果
+
+2026年7月27日に次の順で反映した。
+
+1. D1 Time Travelの適用直前bookmarkを取得した。
+2. migration 047だけを本番D1へ適用した。
+3. commit `5edfcba7e0e3f01f184cbce58a6cf7e484529d3a`を基準にWorkerを配置し、
+   featureを停止した状態でAPIが404になることを確認した。
+4. 対象account、リマインダー停止、Retention有効を設定した。
+5. featureを有効にし、正しいLIFF IDの認証なしアクセスと不正Bearerが401、
+   別LIFF IDが404になることを確認した。
+6. 既存の`/api/liff/config`、同一origin CORS、default rich menu v13が維持され、
+   回答・再案内データが0件であることを再確認した。
+
+本番Workerの現在versionは`3626ec6f-ebac-40fe-bc16-a3ac79716003`である。
+feature停止中の確認versionは`9e8b389d-1587-41a6-b75f-02881ee26f83`、
+最初のコード配置versionは`86233f52-37c2-4339-b1b9-faf77a67782d`である。
+
+公開LIFF URLは次である。
+
+`https://liff.line.me/2010452980-ng2A6Rna/onboarding/satoyama?liffId=2010452980-ng2A6Rna`
+
+このURLがLINE Loginへ到達することは確認したが、本人のLINE認証後の保存フローは未確認である。
+一般向け入口は接続していないため、URLを知るテスト利用者だけが明示操作で開始できる。
+
+GitHub branchは上記commitまでpush済みである。Draft PR #4はGitHub integrationの403により
+Ready化・mergeできていない。本番Workerはpush済みbranchの同一commitから配置しており、
+GitHub側の未mergeと本番反映結果は分離して記録する。
+
+## 14. 本番作業でも行わなかったこと
 
 - 一斉配信、自動push、既存友だちへのメッセージ送信
 - `chat_message.write`の追加
