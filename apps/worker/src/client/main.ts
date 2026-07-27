@@ -17,6 +17,7 @@
 
 import { initBooking } from './booking.js';
 import { initForm } from './form.js';
+import { isSatoyamaOnboardingRequest } from './satoyama-onboarding/intent.js';
 import { safeRedirectTarget } from '../lib/safe-redirect.js';
 
 declare const liff: {
@@ -452,6 +453,23 @@ async function initEventBooking(initialKind: 'detail' | 'history'): Promise<void
 
 async function main() {
   try {
+    // The existing LIFF endpoint is the Worker root. LINE restores an added
+    // path through `liff.state`, while direct browser checks use the path
+    // itself. Mount the dedicated SATOYAMA screen before the legacy root flow
+    // initializes LIFF, so the two clients never compete for one session.
+    if (isSatoyamaOnboardingRequest(new URL(window.location.href))) {
+      const container = document.getElementById('app');
+      if (!container) {
+        showError('mount target #app が見つかりません');
+        return;
+      }
+      const { mountSatoyamaOnboarding } = await import(
+        './satoyama-onboarding/main.js'
+      );
+      await mountSatoyamaOnboarding(container);
+      return;
+    }
+
     await liff.init({ liffId: LIFF_ID });
 
     if (!liff.isLoggedIn()) {
