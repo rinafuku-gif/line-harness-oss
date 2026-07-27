@@ -31,11 +31,24 @@ export interface WorkTemplate {
   prompt: string;
 }
 
+export interface StarterPlanStep {
+  period: string;
+  title: string;
+  action: string;
+}
+
+export interface UsageRule {
+  label: string;
+  detail: string;
+}
+
 export interface CommonBonus {
   version: string;
   title: string;
   summary: string;
   note: string;
+  starterPlan: readonly StarterPlanStep[];
+  usageRules: readonly UsageRule[];
   templates: readonly WorkTemplate[];
 }
 

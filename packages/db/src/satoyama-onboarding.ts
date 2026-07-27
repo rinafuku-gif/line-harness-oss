@@ -69,6 +69,54 @@ export interface SatoyamaOnboardingAnswers {
   area: SatoyamaAreaCode;
 }
 
+export type SatoyamaCustomerAnswerStatus =
+  | 'not_started'
+  | 'started'
+  | 'completed'
+  | 'skipped';
+
+export interface SatoyamaCustomerListItem {
+  friend_id: string;
+  display_name: string | null;
+  picture_url: string | null;
+  is_following: number;
+  friend_created_at: string;
+  status: SatoyamaCustomerAnswerStatus;
+  issue_code: SatoyamaIssueCode | null;
+  role_code: SatoyamaRoleCode | null;
+  area_code: SatoyamaAreaCode | null;
+  questions_started_at: string | null;
+  completed_at: string | null;
+  cta_clicked_at: string | null;
+  answer_updated_at: string | null;
+  chat_status: 'unread' | 'in_progress' | 'resolved';
+}
+
+export interface SatoyamaCustomerListSummary {
+  total: number;
+  not_started: number;
+  started: number;
+  completed: number;
+  skipped: number;
+}
+
+export interface ListSatoyamaCustomersInput {
+  lineAccountId: string;
+  search?: string;
+  status?: SatoyamaCustomerAnswerStatus;
+  issue?: SatoyamaIssueCode;
+  role?: SatoyamaRoleCode;
+  area?: SatoyamaAreaCode;
+  limit?: number;
+  offset?: number;
+}
+
+export interface SatoyamaCustomerListResult {
+  customers: SatoyamaCustomerListItem[];
+  total: number;
+  summary: SatoyamaCustomerListSummary;
+}
+
 export class SatoyamaOnboardingIdempotencyConflict extends Error {
   constructor() {
     super('Idempotency key was already used with different answers');
@@ -160,6 +208,134 @@ export async function getSatoyamaOnboardingState(
     )
     .bind(lineAccountId, friendId, SATOYAMA_ONBOARDING_PROGRAM_VERSION)
     .first<SatoyamaOnboardingState>();
+}
+
+function escapeLikeSearch(value: string): string {
+  return value.replace(/[\\%_]/g, '\\$&');
+}
+
+/**
+ * SATOYAMA管理画面向けの読み取り専用一覧。
+ *
+ * LINEの識別子そのものは返さず、友だちの表示情報と3回答、対応状況だけに絞る。
+ * 回答がまだない友だちも `not_started` として一覧できる。
+ */
+export async function listSatoyamaCustomers(
+  db: D1Database,
+  input: ListSatoyamaCustomersInput,
+): Promise<SatoyamaCustomerListResult> {
+  const limit = Math.min(Math.max(input.limit ?? 50, 1), 100);
+  const offset = Math.max(input.offset ?? 0, 0);
+  const conditions = ['f.line_account_id = ?'];
+  const binds: unknown[] = [input.lineAccountId];
+
+  if (input.search?.trim()) {
+    conditions.push(`COALESCE(f.display_name, '') LIKE ? ESCAPE '\\'`);
+    binds.push(`%${escapeLikeSearch(input.search.trim())}%`);
+  }
+  if (input.status) {
+    if (input.status === 'not_started') {
+      conditions.push(`(s.friend_id IS NULL OR s.status = 'pending')`);
+    } else {
+      conditions.push('s.status = ?');
+      binds.push(input.status);
+    }
+  }
+  if (input.issue) {
+    conditions.push('s.issue_code = ?');
+    binds.push(input.issue);
+  }
+  if (input.role) {
+    conditions.push('s.role_code = ?');
+    binds.push(input.role);
+  }
+  if (input.area) {
+    conditions.push('s.area_code = ?');
+    binds.push(input.area);
+  }
+
+  const where = conditions.join(' AND ');
+  const from = `
+    FROM friends f
+    LEFT JOIN satoyama_onboarding_states s
+      ON s.friend_id = f.id
+     AND s.line_account_id = f.line_account_id
+     AND s.program_version = ${SATOYAMA_ONBOARDING_PROGRAM_VERSION}
+  `;
+
+  const countRow = await db
+    .prepare(`SELECT COUNT(*) AS count ${from} WHERE ${where}`)
+    .bind(...binds)
+    .first<{ count: number }>();
+
+  const rows = await db
+    .prepare(
+      `SELECT
+         f.id AS friend_id,
+         f.display_name,
+         f.picture_url,
+         f.is_following,
+         f.created_at AS friend_created_at,
+         CASE
+           WHEN s.friend_id IS NULL OR s.status = 'pending' THEN 'not_started'
+           ELSE s.status
+         END AS status,
+         s.issue_code,
+         s.role_code,
+         s.area_code,
+         s.questions_started_at,
+         s.completed_at,
+         s.cta_clicked_at,
+         s.updated_at AS answer_updated_at,
+         COALESCE(
+           (
+             SELECT c.status
+               FROM chats c
+              WHERE c.friend_id = f.id
+              ORDER BY c.created_at DESC
+              LIMIT 1
+           ),
+           'resolved'
+         ) AS chat_status
+       ${from}
+       WHERE ${where}
+       ORDER BY COALESCE(s.updated_at, f.created_at) DESC
+       LIMIT ? OFFSET ?`,
+    )
+    .bind(...binds, limit, offset)
+    .all<SatoyamaCustomerListItem>();
+
+  const summaryRow = await db
+    .prepare(
+      `SELECT
+         COUNT(*) AS total,
+         SUM(CASE WHEN s.friend_id IS NULL OR s.status = 'pending' THEN 1 ELSE 0 END) AS not_started,
+         SUM(CASE WHEN s.status = 'started' THEN 1 ELSE 0 END) AS started,
+         SUM(CASE WHEN s.status = 'completed' THEN 1 ELSE 0 END) AS completed,
+         SUM(CASE WHEN s.status = 'skipped' THEN 1 ELSE 0 END) AS skipped
+       ${from}
+       WHERE f.line_account_id = ?`,
+    )
+    .bind(input.lineAccountId)
+    .first<{
+      total: number;
+      not_started: number;
+      started: number;
+      completed: number;
+      skipped: number;
+    }>();
+
+  return {
+    customers: rows.results ?? [],
+    total: Number(countRow?.count ?? 0),
+    summary: {
+      total: Number(summaryRow?.total ?? 0),
+      not_started: Number(summaryRow?.not_started ?? 0),
+      started: Number(summaryRow?.started ?? 0),
+      completed: Number(summaryRow?.completed ?? 0),
+      skipped: Number(summaryRow?.skipped ?? 0),
+    },
+  };
 }
 
 async function getAnswerEvent(

@@ -2,6 +2,7 @@ import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it, vi } from 'vitest';
 import { OnboardingOutcomeCard } from '../src/components/onboarding/OnboardingOutcomeCard.js';
+import { onboardingPreviewPayload } from '../src/dev/onboarding-preview.js';
 
 const outcome = {
   issue: 'handoff' as const,
@@ -26,20 +27,22 @@ const outcome = {
 
 describe('SATOYAMA onboarding outcome copy', () => {
   it('describes copy fallback and avoids the internal term 適合確認', () => {
+    const commonBonus = onboardingPreviewPayload().program.commonBonus;
     const html = renderToStaticMarkup(
       createElement(OnboardingOutcomeCard, {
         outcome,
+        commonBonus,
         sending: false,
         actionMessage: null,
         onSendToChat: vi.fn(),
-        onIssueBonusOpened: vi.fn(),
+        onStarterKitOpened: vi.fn(),
         onRestart: vi.fn(),
         onClose: vi.fn(),
       }),
     );
 
     expect(html).toContain('LINEトークへ送るか、コピーします');
-    expect(html).toContain('無料相談の予約は自動では始まりません');
+    expect(html).toContain('送信や予約が自動で始まることはありません');
     expect(html).not.toContain('適合確認');
   });
 });

@@ -166,6 +166,9 @@ export async function authMiddleware(c: Context<Env>, next: Next): Promise<Respo
     // LINE 上 rich menu 画像 proxy (Authorization ヘッダなしで <img src> 経由表示)
     path.match(/^\/api\/rich-menu-groups\/external\/[^/]+\/image$/) ||
     path.startsWith('/api/liff/') ||
+    // SATOYAMA Web管理画面向けの読み取り専用endpointは、通常の広いAPI_KEYではなく
+    // route内の専用Bearerで認証する。例外はこのGET endpointだけに限定する。
+    (c.req.method === 'GET' && path === '/api/internal/satoyama/customers') ||
     // Admin login/logout — issue/clear the session cookie before auth exists.
     path === '/api/auth/login' ||
     path === '/api/auth/logout' ||

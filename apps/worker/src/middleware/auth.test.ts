@@ -48,6 +48,8 @@ function app() {
   a.route('/', adminAuth);
   a.get('/api/protected', (c) => c.json({ success: true, data: c.get('staff') }));
   a.post('/api/protected', (c) => c.json({ success: true, data: c.get('staff') }));
+  a.get('/api/internal/satoyama/customers', (c) => c.json({ success: true }));
+  a.post('/api/internal/satoyama/customers', (c) => c.json({ success: true }));
   return a;
 }
 
@@ -155,6 +157,25 @@ describe('protected API access', () => {
     const res = await app().request('/api/protected', {
       headers: { Cookie: 'lh_admin_session=%; other=%E0%A4%A' },
     }, crossSiteEnv());
+    expect(res.status).toBe(401);
+  });
+});
+
+describe('SATOYAMA customer read boundary', () => {
+  test('only the exact GET path bypasses the broad admin API authentication', async () => {
+    const res = await app().request('/api/internal/satoyama/customers', {}, crossSiteEnv());
+    expect(res.status).toBe(200);
+  });
+
+  test('POST to the same path still requires the broad admin API authentication', async () => {
+    const res = await app().request('/api/internal/satoyama/customers', {
+      method: 'POST',
+    }, crossSiteEnv());
+    expect(res.status).toBe(401);
+  });
+
+  test('a neighboring path does not inherit the GET exception', async () => {
+    const res = await app().request('/api/internal/satoyama/customers/export', {}, crossSiteEnv());
     expect(res.status).toBe(401);
   });
 });

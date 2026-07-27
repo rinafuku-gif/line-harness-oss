@@ -604,3 +604,52 @@ PC ChromeはLINEログイン状態がなかったため、クリーンアップ�
 
 今回、既存回答の自動復元仕様は変更していない。「回答をやり直す」導線は別のUX改善候補で
 あり、この誤データ是正には含めない。
+
+## 17. 2026年7月27日 回答後特典とWeb管理画面連携
+
+### 回答後特典
+
+特典を回答前に全文表示していた構成をやめ、回答前は内容の予告だけ、3問完了後に本体を
+開ける構成へ変更した。回答前のボタンは「3問に答えて無料で受け取る」とし、回答は任意、
+相談送信や予約は自動で始まらない条件を維持する。
+
+特典名は「AI活用スタートキット」。次の4点を1画面にまとめる。
+
+- 回答した課題に合わせた業務整理シート
+- 30日で1業務を小さく試す4週間の進め方
+- 社内AI利用ルールのたたき台
+- メール返信、会議メモ、社内手順に使うAI指示文3つ
+
+回答前の画面から具体的なシート、進め方、ルール、指示文は開けない。回答完了後の特典を
+開いた時だけ、共通特典と課題別特典の閲覧イベントを記録する。
+
+### Web管理画面向け読み取り連携
+
+SATOYAMA Webの既存管理画面から回答者を確認するため、
+`GET /api/internal/satoyama/customers`を追加した。LINE HarnessのD1を正本のまま利用し、
+Web側DBには顧客情報を複製しない。
+
+- 固定したSATOYAMA LINE accountだけを対象にする
+- 専用Bearer `SATOYAMA_SITE_READ_TOKEN`を通常の`API_KEY`から分離する
+- tokenまたはaccount設定がない時は404、token不一致は401で閉じる
+- 一覧は最大100件、表示名・回答状況・課題・立場・業務で絞り込める
+- LINE user IDは返さず、管理画面で必要なfriend ID、表示名、画像、回答分類、
+  対応状況、更新時刻だけを返す
+- 応答は`Cache-Control: private, no-store`
+
+専用endpointは通常の管理API認証の例外にするが、例外はGETかつ完全一致pathだけに限定し、
+route内の専用Bearerで再認証する。外部送信、タグ変更、配信、回答更新は行わない。
+
+### 検証
+
+- Worker: 61 files / 738 tests
+- DB: 3 files / 18 tests
+- LIFF: 6 files / 19 tests
+- DB / Worker TypeScript typecheck
+- LIFF / Worker production build
+- 専用token未設定、token欠落、不一致、無効filter、過大page sizeを拒否
+- API応答にLINE user IDを含めないことを自動テストで確認
+- 回答前は特典の予告だけ、回答後だけ特典本体を持つことを自動テストで確認
+
+本番反映時は専用tokenをCloudflare WorkerとSATOYAMA Webのサーバー環境へsecretとして
+同じ値で設定する。token値をブラウザbundle、Git、ログへ出さない。

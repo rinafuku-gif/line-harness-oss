@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
-import { BonusTemplates } from '../components/onboarding/BonusTemplates.js';
 import { OnboardingOutcomeCard } from '../components/onboarding/OnboardingOutcomeCard.js';
 import { QuestionStep } from '../components/onboarding/QuestionStep.js';
 import { SatoyamaBrandLogo } from '../components/onboarding/SatoyamaBrandLogo.js';
+import { StarterKitTeaser } from '../components/onboarding/StarterKitTeaser.js';
 import {
   OnboardingApiError,
   onboardingApi,
@@ -251,6 +251,11 @@ export default function SatoyamaOnboarding() {
     }
   }
 
+  function trackStarterKit() {
+    trackCommonBonus();
+    trackIssueBonus();
+  }
+
   if (loading) {
     return (
       <div className="satoyama-onboarding-page">
@@ -315,10 +320,11 @@ export default function SatoyamaOnboarding() {
       <div className="satoyama-onboarding-page">
         <OnboardingOutcomeCard
           outcome={outcome}
+          commonBonus={payload.program.commonBonus}
           sending={submitting}
           actionMessage={actionMessage}
           onSendToChat={() => void sendOutcomeToChat()}
-          onIssueBonusOpened={trackIssueBonus}
+          onStarterKitOpened={trackStarterKit}
           onRestart={startQuestions}
           onClose={closeLiffWindow}
         />
@@ -352,13 +358,10 @@ export default function SatoyamaOnboarding() {
             </p>
           ) : null}
 
-          <BonusTemplates
-            bonus={payload.program.commonBonus}
-            onOpened={trackCommonBonus}
-          />
+          <StarterKitTeaser />
 
           <button type="button" className="primary-button" onClick={startQuestions}>
-            3問に答える
+            3問に答えて無料で受け取る
           </button>
           <p className="time-note">目安25〜40秒・入力作業なし</p>
           <div className="footer-actions vertical">
