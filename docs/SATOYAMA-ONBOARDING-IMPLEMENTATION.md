@@ -1,7 +1,7 @@
 # SATOYAMA LINE登録直後オンボーディング 実装記録
 
 確認日: 2026年7月27日
-状態: D1 migration 047、Worker配置、feature有効化まで完了。一般向け入口の接続とテスト用LINEユーザーでの実機確認は未実施
+状態: D1 migration 047、無限待機hotfix、Worker再配置、feature有効化、独自ドメインproxyまで完了。LINE Developersのendpoint切替とテスト用LINEユーザーでの実機確認は未完了
 
 ## 1. 結論
 
@@ -403,3 +403,113 @@ GitHub側の未mergeと本番反映結果は分離して記録する。
 - v13の既存ボタンを説明と異なる機能へ付け替えること
 - 元checkout `/Users/Inaryo/satoyama-ai-base`の編集
 - オンボーディング専用Pages projectの新設
+
+## 15. 2026年7月27日「読み込み中…」無限待機hotfix
+
+### 発生事象と原因
+
+RyoさんのiPhone LINE内ブラウザで公開LIFFを開いたところ、Reactの
+「読み込み中…」カードが消えない事象が発生した。専用path判定、遅延読込、React mount開始
+までは到達していたが、次の3箇所に時間上限がなかった。
+
+- LIFF SDKの`liff.init`
+- LIFF画面からオンボーディングAPIへの`fetch`
+- WorkerからLINE ID token verify APIへの`fetch`
+
+このため、いずれか1つが応答を返さないと`loading=true`から抜けず、成功、明確なエラー、
+再試行のどこにも収束しない構造だった。元のiPhone事象で3箇所のうち実際にどの通信が
+止まったかは、発生時の段階ログがなく事後には断定できない。確認できた根本原因は、
+外部通信の保留を有限時間で扱わない設計である。
+
+### 修正
+
+- LIFF SDK初期化を10秒で打ち切り、ログイン移動中または再試行可能なエラーを表示する。
+- オンボーディングAPI要求全体を10秒で打ち切る。`AbortController`だけに依存せず、
+  `fetch`自体が保留したままでもtimeout Promiseで必ず終了する。
+- LINE verify APIを5秒で打ち切り、Workerは503を返す。
+- 初期の静的「読み込み中…」をReact読込開始直後に
+  「LINEとの接続を確認しています」へ置き換え、失敗時は「もう一度試す」を表示する。
+- LIFFログインの`redirectUri`に現在のpath、query、`liff.state`を保持する。
+- token verify timeout時のログは固定文だけとし、LINE user ID、token、回答内容を出さない。
+
+実装commitは`3848967`、LIFF root proxy修正commitは`2f70d4c`で、
+branch `feat/satoyama-line-onboarding`へpushした。Draft PR #4のmerge権限403は、
+本番hotfixと分離したままである。
+
+### 独自ドメイン
+
+`satoyama-ai-base.com`の権威DNSはVercelの
+`ns1.vercel-dns.com` / `ns2.vercel-dns.com`であり、Cloudflare zoneではない。
+影響の大きいNS移管は行わず、Vercelの専用project `satoyama-line-proxy`から既存Workerへ
+同一originのexternal rewriteを設定した。
+
+- 公開host: `https://line.satoyama-ai-base.com`
+- Vercel project: `satoyama-line-proxy`
+- 本番deployment: `dpl_BmqBm9MzozHj4Yq4ZMzC29yipQVm`
+- upstream: 既存Worker。redirectではなくrewriteのため、ブラウザのURLは独自hostのまま
+- `/`専用rewriteと`/:path*`の両方を持ち、既存LIFF root、予約、フォーム、
+  オンボーディングを同一hostで通す
+- `X-Robots-Tag: noindex, nofollow`、Vercel rewrite cache無効化headerを設定
+
+root 200、`/book`から独自hostの`/?page=book`への302、予約画面200、
+フォーム画面200、オンボーディング画面200を確認した。独自domainを付ける前の404状態も
+確認してから割り当てており、既存Vercel site projectや意図せず作られた空projectには
+触れていない。
+
+### Worker反映と安全確認
+
+hotfix前のWorker version
+`3626ec6f-ebac-40fe-bc16-a3ac79716003`と、D1 Time Travel bookmark
+`000009e5-00000056-000050b5-f68ce17b6b7250c34deaec54ff077abd`を復旧点として保持した。
+D1 migrationやデータ変更は行っていない。
+
+1. `SATOYAMA_ONBOARDING_ENABLED=false`で正しいAPIが404になることを確認した。
+2. hotfix codeをversion `96a2c772-2563-4a5f-94f9-2a0bf9976070`として配置した。
+3. Worker直・独自domainの画面、API、予約、フォームをfeature OFFで確認した。
+4. featureを再度有効にし、最終version
+   `446b12ee-6cc4-45ab-bb87-4b8351033206`を100%配信した。
+5. 一意queryで、正しいLIFF IDへの認証なし要求がWorker直・独自domainとも401、
+   feature ON、account境界有効を確認した。
+6. Cloudflare tailを自分のIP、GET、最終versionだけに絞り、独自domainへ送った一意な
+   canaryがWorkerのオンボーディングAPIへ到達し、正常に処理完了したことを実ログで確認した。
+
+最終設定は従来どおり、feature ON、48時間リマインダー OFF、Retention ONである。
+D1、予約/フォームデータ、v13、一斉配信、既存友だちへのpushは変更していない。
+hotfix後の読み取り集計ではオンボーディングstate 0件、回答event 0件、書込み0件だった。
+
+### 再検証
+
+- Worker全テスト: 60 files / 734 tests
+- DB全テスト: 3 files / 16 tests
+- LIFF全テスト: 4 files / 16 tests
+- Worker / DB TypeScript typecheck
+- LIFF / Worker production build
+- DB bootstrap生成差分なし
+- 直接pathと`liff.state`で専用画面をmountし、3問回答後の案内まで確認
+- 保留したLIFF init、画面fetch、LINE verifyがそれぞれ有限時間で失敗へ収束するテスト
+- LINE verify timeoutが503になり、再試行可能な日本語案内になることを確認
+- 既存の予約・フォーム・イベント関連テストを含むWorker全テストを再実行
+
+通常ブラウザから独自domainを開いた確認では、現時点のLIFF endpointが旧Worker hostのため、
+LIFF SDKがhost不一致を検出してLINEの400画面へ有限時間で移動した。これは無限待機が
+解消している確認にはなるが、正常認証の完了確認ではない。
+
+### 残る本人操作
+
+LINE DevelopersのLIFF endpointを、root pathを変えず次へ変更する必要がある。
+
+`https://line.satoyama-ai-base.com?liffId=2010452980-ng2A6Rna`
+
+現在はLINE Developersの本人ログイン画面で止まっている。endpoint変更後に公開LIFF URLから
+認可URLの`redirect_uri`が独自domainへ変わったことを確認し、RyoさんのiPhone LINE内で
+初回、再訪、3問、再回答、スキップを最終確認する。既存予約・フォームが同じLIFF IDを
+共有するため、endpointのpathは`/onboarding/satoyama`へ変更せずrootのままにする。
+
+### hotfixのロールバック
+
+1. 即時停止は`SATOYAMA_ONBOARDING_ENABLED=false`。リマインダーはOFFのまま維持する。
+2. code rollbackはWorker version
+   `3626ec6f-ebac-40fe-bc16-a3ac79716003`へtrafficを戻す。
+3. endpoint変更後のdomain rollbackは、LINE Developersのendpointを旧Worker rootへ戻す。
+4. proxyだけのrollbackは`line.satoyama-ai-base.com`のproject割当を外す。
+5. D1は今回変更していないため、hotfix rollbackでtable削除やデータ復元を行わない。
