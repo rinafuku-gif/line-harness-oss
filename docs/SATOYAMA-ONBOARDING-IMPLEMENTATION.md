@@ -1,7 +1,7 @@
 # SATOYAMA LINE登録直後オンボーディング 実装記録
 
 確認日: 2026年7月27日
-状態: D1 migration 047、無限待機hotfix、Worker再配置、feature有効化、独自ドメインproxy、LINE Developersのendpoint切替、PC Chromeでの実認証・3問・再回答・再訪確認まで完了。RyoさんのiPhone LINE内ブラウザでの再確認だけ未完了
+状態: D1 migration 047、無限待機hotfix、Worker再配置、feature有効化、独自ドメインproxy、LINE Developersのendpoint切替まで完了。PC Chrome実認証テストで誤って残したRyoさん本人の検証データは限定クリーンアップ済み。iPhone LINE内ブラウザでイントロから始まることの本人再確認だけ未完了
 
 ## 1. 結論
 
@@ -526,3 +526,81 @@ RyoさんのiPhone LINE内ブラウザで、次の公開URLを再度開き、上
 3. endpoint変更後のdomain rollbackは、LINE Developersのendpointを旧Worker rootへ戻す。
 4. proxyだけのrollbackは`line.satoyama-ai-base.com`のproject割当を外す。
 5. D1は今回変更していないため、hotfix rollbackでtable削除やデータ復元を行わない。
+
+## 16. 2026年7月27日 本番検証データの限定クリーンアップ
+
+### 発生事象
+
+Ryoさんは3問へ回答していないのに、iPhone LINE内ブラウザで公開LIFFを開くと、
+`key_person / owner / sales`の完了画面が復元された。
+
+### 確認できた原因
+
+本番D1を読み取りで照合し、次を確認した。
+
+- SATOYAMA account、program version 1のstateは1件、friendは1人
+- state作成は`2026-07-27T12:32:32.063+09:00`
+- 1回目の回答eventは`unsure_start / owner / sales`で
+  `2026-07-27T12:32:48.932+09:00`
+- 2回目の回答eventは`key_person / owner / sales`で
+  `2026-07-27T12:33:20.873+09:00`
+- 最終state、friend metadata、3つの`[SB]`タグは2回目の回答と一致
+
+この時刻と回答変更は、直前に記録したPC Chrome実認証の「初回回答→課題だけ変更→再訪」の
+検証内容と一致する。PCでLINE認証したユーザーがRyoさん本人と同じLINE user IDだったため、
+本番D1に保存された検証回答がiPhone再訪時に仕様どおり復元された。既存の回答自動復元に
+不具合があったのではなく、実利用者を本番書き込みE2Eに使い、終了後に検証データを
+クリーンアップしなかった運用が原因である。
+
+### 限定クリーンアップ
+
+変更直前のD1 Time Travel bookmark:
+
+`000009e6-00000020-000050b5-5959d2cdc352a1576dc592a7c03870e9`
+
+account、program、回答値、state作成時刻、完了時刻、event件数2件が全て一致するfriendだけを
+対象にし、次を削除・初期化した。
+
+- `satoyama_onboarding_states`: 1件削除
+- `satoyama_onboarding_answer_events`: 2件削除
+- 対象friendの`[SB]`タグ割当: 3件削除
+- 対象friendのオンボーディング専用`sb_*` metadata: 1行から7キーを除去
+
+friend行、通常metadata、`[SB]`以外のタグ、タグ定義、予約、フォーム、会話、他accountは
+変更していない。変更後はstate 0件、event 0件、`[SB]`タグ割当0件、
+オンボーディングmetadataを持つfriend 0件を確認した。
+
+変更後のD1 Time Travel bookmark:
+
+`000009e6-00000022-000050b5-a0ecb5c6d5ccc6b2ab0d54c8120cfb47`
+
+### 再発防止
+
+本番の通常確認は、`pnpm canary:satoyama-onboarding:production`と実機のイントロ表示までに
+限定する。このcanaryは公開HTMLへのGETと、認証なしAPIが401で閉じることだけを確認し、
+Bearer token、LINE user ID、friend ID、POST bodyを使わない。
+
+3問回答、再回答、スキップ、CTAの確認はローカル`preview=1`を第一選択にする。本番が
+不可欠な場合だけ専用LINEテストユーザーを使い、開始前の復元点と件数、検証後の限定
+クリーンアップまでを同じ作業として扱う。詳細は
+`docs/SATOYAMA-ONBOARDING-PRODUCTION-E2E-SAFETY.md`を正本とする。
+
+限定クリーンアップ後、次を再確認した。
+
+- 本番の読み取り専用canary: 公開画面200、認証なしAPI 401
+- ローカルpreview: イントロ表示から「3問に答える」で質問1/3へ進む
+- preview確認後の本番D1: state 0件、event 0件、`[SB]`タグ割当0件、
+  オンボーディングmetadata 0件のまま
+- scripts: 6 files / 40 tests
+- DB: 3 files / 16 tests
+- Worker: 60 files / 734 tests
+- LIFF: 4 files / 16 tests
+- DB / Worker typecheck、LIFF / Worker production build
+
+PC ChromeはLINEログイン状態がなかったため、クリーンアップ後の本番実認証画面は
+「LINEアプリから開き直してください」までの確認になった。実認証状態でイントロが表示される
+最終確認はRyoさんのiPhoneで行う。これは未確認として残し、PCから再ログインしてRyoさんの
+レコードを使う方法では代替しない。
+
+今回、既存回答の自動復元仕様は変更していない。「回答をやり直す」導線は別のUX改善候補で
+あり、この誤データ是正には含めない。
