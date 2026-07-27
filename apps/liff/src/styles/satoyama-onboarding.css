@@ -53,18 +53,12 @@
   line-height: 1.8;
 }
 
-.brand-mark {
-  display: grid;
-  width: 46px;
-  height: 46px;
-  margin-bottom: 16px;
-  border-radius: 15px 15px 15px 5px;
-  color: #fff;
-  background: var(--forest);
-  place-items: center;
-  font-family: Georgia, serif;
-  font-size: 1.5rem;
-  font-weight: 700;
+.brand-logo {
+  display: block;
+  width: 56px;
+  height: 56px;
+  margin-bottom: 18px;
+  object-fit: contain;
 }
 
 .eyebrow,

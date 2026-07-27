@@ -1,5 +1,6 @@
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
+import satoyamaLogoUrl from '../../../../liff/src/assets/satoyama-logo-mark.png';
 import SatoyamaOnboarding from '../../../../liff/src/pages/SatoyamaOnboarding.js';
 import { initLiff } from '../../../../liff/src/lib/liff-auth.js';
 import '../../../../liff/src/index.css';
@@ -47,7 +48,14 @@ function renderBootstrapState(
     <div class="satoyama-onboarding-page">
       <main class="onboarding-shell">
         <section class="onboarding-card error-card" role="${state === 'error' ? 'alert' : 'status'}">
-          <p class="eyebrow">SATOYAMA AI BASE</p>
+          <img
+            class="brand-logo"
+            src="${satoyamaLogoUrl}"
+            alt="SATOYAMA AI BASE"
+            width="512"
+            height="512"
+            decoding="async"
+          >
           <h1>${content.title}</h1>
           <p>${content.body}</p>
           ${retry}

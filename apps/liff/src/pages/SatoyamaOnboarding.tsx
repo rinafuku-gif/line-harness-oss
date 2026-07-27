@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { BonusTemplates } from '../components/onboarding/BonusTemplates.js';
 import { OnboardingOutcomeCard } from '../components/onboarding/OnboardingOutcomeCard.js';
 import { QuestionStep } from '../components/onboarding/QuestionStep.js';
+import { SatoyamaBrandLogo } from '../components/onboarding/SatoyamaBrandLogo.js';
 import {
   OnboardingApiError,
   onboardingApi,
@@ -268,7 +269,7 @@ export default function SatoyamaOnboarding() {
       <div className="satoyama-onboarding-page">
         <main className="onboarding-shell">
           <section className="onboarding-card error-card" role="alert">
-            <p className="eyebrow">SATOYAMA AI BASE</p>
+            <SatoyamaBrandLogo />
             <h1>ページを開けませんでした</h1>
             <p>{error}</p>
             <button
@@ -329,10 +330,7 @@ export default function SatoyamaOnboarding() {
     <div className="satoyama-onboarding-page">
       <main className="onboarding-shell">
         <section className="onboarding-card intro-card" aria-labelledby="intro-title">
-          <div className="brand-mark" aria-hidden="true">
-            S
-          </div>
-          <p className="eyebrow">SATOYAMA AI BASE</p>
+          <SatoyamaBrandLogo />
           <h1 id="intro-title">{payload.program.title}</h1>
           <p className="intro-copy">{payload.program.intro}</p>
           <p className="privacy-note">
