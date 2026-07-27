@@ -390,9 +390,10 @@ feature停止中の確認versionは`9e8b389d-1587-41a6-b75f-02881ee26f83`、
 このURLがLINE Loginへ到達することは確認したが、本人のLINE認証後の保存フローは未確認である。
 一般向け入口は接続していないため、URLを知るテスト利用者だけが明示操作で開始できる。
 
-GitHub branchは上記commitまでpush済みである。Draft PR #4はGitHub integrationの403により
-Ready化・mergeできていない。本番Workerはpush済みbranchの同一commitから配置しており、
-GitHub側の未mergeと本番反映結果は分離して記録する。
+GitHub branchは上記commitまでpush済みである。当初GitHub integrationでは403だったが、
+ローカルで最新`main`との競合がないことを確認した後、CLIの既存認証でPR #4をReady化し、
+2026年7月27日にmergeした。merge commitは
+`3862d1e36b667bccff9eb9232ccd81cfc6b8845a`である。
 
 ## 14. 本番作業でも行わなかったこと
 
@@ -433,8 +434,8 @@ RyoさんのiPhone LINE内ブラウザで公開LIFFを開いたところ、React
 - token verify timeout時のログは固定文だけとし、LINE user ID、token、回答内容を出さない。
 
 実装commitは`3848967`、LIFF root proxy修正commitは`2f70d4c`で、
-branch `feat/satoyama-line-onboarding`へpushした。Draft PR #4のmerge権限403は、
-本番hotfixと分離したままである。
+branch `feat/satoyama-line-onboarding`へpushした。検証記録commit `91bb30e`までを
+PR #4でmergeし、merge commitは`3862d1e36b667bccff9eb9232ccd81cfc6b8845a`である。
 
 ### 独自ドメイン
 
