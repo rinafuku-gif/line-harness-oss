@@ -34,6 +34,9 @@ const isPreview =
 
 function friendlyError(error: unknown): string {
   if (error instanceof OnboardingApiError) {
+    if (error.code === 'request_timeout') {
+      return 'LINEとの接続確認に時間がかかっています。通信状態を確認して、もう一度お試しください。';
+    }
     if (error.code === 'not_following') {
       return 'LINE公式アカウントを友だち追加した状態で、もう一度開いてください。';
     }

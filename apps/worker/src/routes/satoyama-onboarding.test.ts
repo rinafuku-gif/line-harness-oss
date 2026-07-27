@@ -136,6 +136,26 @@ describe('SATOYAMA onboarding routes', () => {
     expect(db.prepare).not.toHaveBeenCalled();
   });
 
+  it('returns a retryable 503 when LINE token verification times out', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    vi.mocked(verifyLiffAccountCaller).mockResolvedValue({
+      ok: false,
+      reason: 'verification_timeout',
+    });
+
+    const response = await setup().request(
+      '/api/liff/onboarding/satoyama?liffId=123456-test',
+      { headers: { Authorization: 'Bearer token' } },
+      env(),
+    );
+
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toMatchObject({
+      success: false,
+      error: 'Authentication unavailable',
+    });
+  });
+
   it('returns an optional three-question program without requiring admin CSRF cookies', async () => {
     const response = await setup().request(
       '/api/liff/onboarding/satoyama?liffId=123456-test',

@@ -3,6 +3,8 @@ import liff from '@line/liff';
 let _liffId: string | null = null;
 let _idToken: string | null = null;
 
+const DEFAULT_LIFF_INIT_TIMEOUT_MS = 10_000;
+
 function liffIdFromState(url: URL): string | null {
   const state = url.searchParams.get('liff.state');
   if (!state) return null;
@@ -14,22 +16,48 @@ function liffIdFromState(url: URL): string | null {
   }
 }
 
-export async function initLiff(): Promise<boolean> {
+export function resolveLiffId(url: URL): string | null {
+  return (
+    url.searchParams.get('liffId') ??
+    liffIdFromState(url) ??
+    import.meta.env.VITE_DEFAULT_LIFF_ID ??
+    null
+  );
+}
+
+function withTimeout<T>(
+  operation: Promise<T>,
+  timeoutMs: number,
+  timeoutMessage: string,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(timeoutMessage)), timeoutMs);
+  });
+  return Promise.race([operation, timeout]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer);
+  });
+}
+
+export async function initLiff(
+  options: { timeoutMs?: number } = {},
+): Promise<boolean> {
   const url = new URL(window.location.href);
   // On the first LIFF redirect, additional path/query information can still
   // be packed into liff.state. Read the public liffId from there only for SDK
   // initialization; the server independently binds it to one account.
-  const liffId =
-    url.searchParams.get('liffId') ??
-    liffIdFromState(url) ??
-    import.meta.env.VITE_DEFAULT_LIFF_ID;
+  const liffId = resolveLiffId(url);
   if (!liffId) {
     throw new Error('liffId not provided. Append ?liffId=... to the URL.');
   }
   _liffId = liffId;
-  await liff.init({ liffId });
+  await withTimeout(
+    liff.init({ liffId }),
+    options.timeoutMs ?? DEFAULT_LIFF_INIT_TIMEOUT_MS,
+    'LINEとの接続確認が時間内に完了しませんでした。',
+  );
   if (!liff.isLoggedIn()) {
-    liff.login();
+    liff.login({ redirectUri: url.href });
     return false;
   }
   // id_token は Worker 側で LINE Login verify API を叩いて caller を確定するために使う。

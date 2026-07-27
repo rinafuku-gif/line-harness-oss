@@ -1,6 +1,7 @@
 import { getIdToken, getLiffId } from './liff-auth.js';
 
 const BASE = import.meta.env.VITE_API_BASE ?? '';
+export const ONBOARDING_REQUEST_TIMEOUT_MS = 10_000;
 
 export type IssueCode =
   | 'key_person'
@@ -111,24 +112,46 @@ function endpoint(path = ''): URL {
 }
 
 async function request<T>(path = '', init: RequestInit = {}): Promise<T> {
-  const response = await fetch(endpoint(path), {
-    ...init,
-    headers: {
-      Authorization: `Bearer ${getIdToken()}`,
-      ...(init.body ? { 'Content-Type': 'application/json' } : {}),
-      ...init.headers,
-    },
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(new OnboardingApiError(0, 'request_timeout'));
+    }, ONBOARDING_REQUEST_TIMEOUT_MS);
   });
-  const payload = (await response.json().catch(() => null)) as
-    | { success?: boolean; error?: string; data?: T }
-    | null;
-  if (!response.ok || !payload?.success || payload.data === undefined) {
-    throw new OnboardingApiError(
-      response.status,
-      payload?.error ?? 'request_failed',
-    );
+  const operation = (async () => {
+    const response = await fetch(endpoint(path), {
+      ...init,
+      signal: controller.signal,
+      headers: {
+        Authorization: `Bearer ${getIdToken()}`,
+        ...(init.body ? { 'Content-Type': 'application/json' } : {}),
+        ...init.headers,
+      },
+    });
+    const payload = (await response.json().catch(() => null)) as
+      | { success?: boolean; error?: string; data?: T }
+      | null;
+    if (!response.ok || !payload?.success || payload.data === undefined) {
+      throw new OnboardingApiError(
+        response.status,
+        payload?.error ?? 'request_failed',
+      );
+    }
+    return payload.data;
+  })();
+
+  try {
+    return await Promise.race([operation, timeout]);
+  } catch (error) {
+    if (controller.signal.aborted && !(error instanceof OnboardingApiError)) {
+      throw new OnboardingApiError(0, 'request_timeout');
+    }
+    throw error;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
   }
-  return payload.data;
 }
 
 function post<T>(path: string, body?: unknown): Promise<T> {

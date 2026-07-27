@@ -15,6 +15,7 @@ function accountDb(
 }
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.unstubAllGlobals();
 });
 
@@ -124,5 +125,32 @@ describe('verifyLiffAccountCaller', () => {
       },
     );
     expect(result).toEqual({ ok: false, reason: 'verification_unavailable' });
+  });
+
+  it('settles as unavailable when LINE verification never resolves', async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn().mockReturnValue(new Promise(() => undefined));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const resultPromise = verifyLiffAccountCaller(
+      'Bearer token',
+      '123456-test',
+      'account-satoyama',
+      {
+        DB: accountDb({
+          id: 'account-satoyama',
+          liff_id: '123456-test',
+          login_channel_id: 'expected-channel',
+        }),
+      },
+    );
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    await expect(resultPromise).resolves.toEqual({
+      ok: false,
+      reason: 'verification_timeout',
+    });
+    const init = fetchMock.mock.calls[0][1] as RequestInit;
+    expect(init.signal?.aborted).toBe(true);
   });
 });

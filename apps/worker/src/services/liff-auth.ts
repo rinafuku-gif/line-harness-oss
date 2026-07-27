@@ -5,6 +5,8 @@
 
 import { getLineAccounts } from '@line-crm/db';
 
+const LINE_VERIFY_TIMEOUT_MS = 5_000;
+
 export interface VerifyEnv {
   LINE_LOGIN_CHANNEL_ID?: string;
   DB: D1Database;
@@ -24,6 +26,7 @@ export type VerifyLiffAccountCallerResult =
         | 'unknown_liff'
         | 'login_channel_not_configured'
         | 'invalid_token'
+        | 'verification_timeout'
         | 'verification_unavailable';
     };
 
@@ -98,15 +101,27 @@ export async function verifyLiffAccountCaller(
     return { ok: false, reason: 'login_channel_not_configured' };
   }
 
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(new Error('LINE_VERIFY_TIMEOUT'));
+    }, LINE_VERIFY_TIMEOUT_MS);
+  });
   try {
-    const response = await fetch('https://api.line.me/oauth2/v2.1/verify', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
-        id_token: idToken,
-        client_id: account.login_channel_id,
+    const response = await Promise.race([
+      fetch('https://api.line.me/oauth2/v2.1/verify', {
+        method: 'POST',
+        signal: controller.signal,
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          id_token: idToken,
+          client_id: account.login_channel_id,
+        }),
       }),
-    });
+      timeout,
+    ]);
     if (!response.ok) return { ok: false, reason: 'invalid_token' };
 
     const verified = (await response.json()) as { sub?: string; aud?: string };
@@ -119,7 +134,15 @@ export async function verifyLiffAccountCaller(
       accountId: account.id,
       liffId: account.liff_id,
     };
-  } catch {
+  } catch (error) {
+    if (
+      controller.signal.aborted ||
+      (error instanceof Error && error.message === 'LINE_VERIFY_TIMEOUT')
+    ) {
+      return { ok: false, reason: 'verification_timeout' };
+    }
     return { ok: false, reason: 'verification_unavailable' };
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
   }
 }

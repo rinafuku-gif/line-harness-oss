@@ -53,8 +53,12 @@ async function authenticateCaller(c: Context<Env>): Promise<CallerResult> {
     }
     if (
       verified.reason === 'login_channel_not_configured' ||
+      verified.reason === 'verification_timeout' ||
       verified.reason === 'verification_unavailable'
     ) {
+      if (verified.reason === 'verification_timeout') {
+        console.warn('[satoyama-onboarding] LINE token verification timed out');
+      }
       return {
         ok: false,
         response: c.json({ success: false, error: 'Authentication unavailable' }, 503),
