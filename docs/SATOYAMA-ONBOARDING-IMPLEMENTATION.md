@@ -1,7 +1,7 @@
 # SATOYAMA LINE登録直後オンボーディング 実装記録
 
 確認日: 2026年7月27日
-状態: D1 migration 047、無限待機hotfix、Worker再配置、feature有効化、独自ドメインproxyまで完了。LINE Developersのendpoint切替とテスト用LINEユーザーでの実機確認は未完了
+状態: D1 migration 047、無限待機hotfix、Worker再配置、feature有効化、独自ドメインproxy、LINE Developersのendpoint切替、PC Chromeでの実認証・3問・再回答・再訪確認まで完了。RyoさんのiPhone LINE内ブラウザでの再確認だけ未完了
 
 ## 1. 結論
 
@@ -38,8 +38,8 @@ SATOYAMA AI BASE専用のLIFFオンボーディングを、既存の汎用フォ
   現行DBとmigration管理表の整合を別作業で解決する必要がある。
 - LINE公式アカウントは`SATOYAMA AI BASE`、Basic IDは`@969evmpq`、
   Harness account IDは`c8e69a14-b590-4ce0-8910-fb2b3ae516b5`である。
-- LIFF IDは`2010452980-ng2A6Rna`で、公開LIFF URLから確認できるendpointは現行Worker
-  rootである。
+- LIFF IDは`2010452980-ng2A6Rna`である。初回公開時のendpointは現行Worker rootだったが、
+  hotfix後は同じroot構造を保ったまま`https://line.satoyama-ai-base.com`へ変更した。
 - 公開LIFF URLが生成したLINE Login認可URLでは、実効scopeが`openid profile`であり、
   `chat_message.write`が含まれないことを確認した。オンボーディング実装は`profile`を
   読み取らない。
@@ -58,9 +58,9 @@ SATOYAMA AI BASE専用のLIFFオンボーディングを、既存の汎用フォ
 
 未確認:
 
-- LINE Developers管理画面に表示される設定値そのものは外部ログインが必要で未確認である。
-  ただし公開LIFFの実効認可URLでは`openid profile`とendpointを確認した。
-- テスト用LINEユーザーによる3問回答、再回答、スキップ、ブロック・友だち解除は未確認である。
+- RyoさんのiPhone LINE内ブラウザで、hotfix後の初回表示と再訪を再確認する必要がある。
+- PC ChromeのLINE認証ユーザーでは3問回答と再回答を確認した。スキップ、ブロック・
+  友だち解除は実ユーザーでは未確認であり、自動テストで境界を確認している。
 
 ## 2. 作業場所と基準
 
@@ -256,12 +256,13 @@ LIFF画面とAPIは同じWorker originで配信するため、`SATOYAMA_ONBOARDI
 
 ### LIFF配信 / LINE Developers
 
-- 現行のLIFF endpointはWorker rootのまま変更しない。
+- LIFF endpointはroot pathを保ったまま、次へ変更した。
+  `https://line.satoyama-ai-base.com?liffId=2010452980-ng2A6Rna`
 - LINEがchild pathを`liff.state`に入れてrootを開いた場合と、直接
   `/onboarding/satoyama`を開いた場合だけ、専用React画面を遅延読込する。
 - 既存の友だち追加、予約、フォームの分岐は従来のentry pointを通り、専用画面を読まない。
-- 直接pathではWorkerがroot LIFF shellを200で返す。`/index.html`へのredirectでpathを
-  失わないよう、asset rootを内部取得する。
+- 独自domainはVercelの同一origin rewriteで既存Workerへ接続する。root、直接path、
+  予約、フォーム、APIをredirectせず同じhostで扱う。
 - IDトークン検証には`openid`が必要。
 - このオンボーディング実装はprofile情報を取得しないため、`profile`は不要。
 - 初回公開では`chat_message.write`を追加しない。既存scopeで明示送信が成立しない場合は
@@ -269,9 +270,10 @@ LIFF画面とAPIは同じWorker originで配信するため、`SATOYAMA_ONBOARDI
 - 友だち追加直後メッセージ、または明示した導線から次の形式で開く。
   `https://liff.line.me/{LIFF_ID}/onboarding/satoyama?liffId={LIFF_ID}`
 
-LINE APIでv13とLIFF IDを確認し、公開LIFFのLINE Login認可URLで実効scope
-`openid profile`も確認した。LINE Developers管理画面の表示値は未確認として分離する。
-v13の6ボタンは別用途へ上書きしていない。一般向けの明示ボタンはまだ追加していない。
+LINE APIでv13とLIFF IDを確認し、LINE Developers管理画面でもendpoint、実効scope
+`openid profile`、`chat_message.write`がないことを確認した。公開LIFFの認可URLでも
+`redirect_uri`が独自domainへ変わったことを確認した。v13の6ボタンは別用途へ上書きして
+いない。一般向けの明示ボタンはまだ追加していない。
 
 ## 9. 検証記録
 
@@ -379,16 +381,18 @@ Time Travel復元点、047適用結果、Retention flag、有効化直前の削�
 6. 既存の`/api/liff/config`、同一origin CORS、default rich menu v13が維持され、
    回答・再案内データが0件であることを再確認した。
 
-本番Workerの現在versionは`3626ec6f-ebac-40fe-bc16-a3ac79716003`である。
+初回反映時の本番Worker versionは`3626ec6f-ebac-40fe-bc16-a3ac79716003`である。
 feature停止中の確認versionは`9e8b389d-1587-41a6-b75f-02881ee26f83`、
 最初のコード配置versionは`86233f52-37c2-4339-b1b9-faf77a67782d`である。
+hotfix後の現在versionは`446b12ee-6cc4-45ab-bb87-4b8351033206`である。
 
 公開LIFF URLは次である。
 
 `https://liff.line.me/2010452980-ng2A6Rna/onboarding/satoyama?liffId=2010452980-ng2A6Rna`
 
-このURLがLINE Loginへ到達することは確認したが、本人のLINE認証後の保存フローは未確認である。
-一般向け入口は接続していないため、URLを知るテスト利用者だけが明示操作で開始できる。
+このURLからPC ChromeのLINE認証を完了し、独自domain上で3問回答、回答変更、再訪時の
+最新回答復元まで確認した。一般向け入口は接続していないため、URLを知るテスト利用者だけが
+明示操作で開始できる。
 
 GitHub branchは上記commitまでpush済みである。当初GitHub integrationでは403だったが、
 ローカルで最新`main`との競合がないことを確認した後、CLIの既存認証でPR #4をReady化し、
@@ -476,7 +480,9 @@ D1 migrationやデータ変更は行っていない。
 
 最終設定は従来どおり、feature ON、48時間リマインダー OFF、Retention ONである。
 D1、予約/フォームデータ、v13、一斉配信、既存友だちへのpushは変更していない。
-hotfix後の読み取り集計ではオンボーディングstate 0件、回答event 0件、書込み0件だった。
+endpoint変更前の読み取り集計ではオンボーディングstate 0件、回答event 0件だった。
+PC Chromeの実認証テスト後はstate 1件、回答event 2件となった。2件は初回回答と
+回答変更の検証データであり、確認用の集計SQL自体は書込み0件だった。
 
 ### 再検証
 
@@ -491,20 +497,26 @@ hotfix後の読み取り集計ではオンボーディングstate 0件、回答e
 - LINE verify timeoutが503になり、再試行可能な日本語案内になることを確認
 - 既存の予約・フォーム・イベント関連テストを含むWorker全テストを再実行
 
-通常ブラウザから独自domainを開いた確認では、現時点のLIFF endpointが旧Worker hostのため、
-LIFF SDKがhost不一致を検出してLINEの400画面へ有限時間で移動した。これは無限待機が
-解消している確認にはなるが、正常認証の完了確認ではない。
+LINE Developersの管理画面でendpointを
+`https://line.satoyama-ai-base.com?liffId=2010452980-ng2A6Rna`へ変更した。公開LIFF URLが
+生成した認可URLの`redirect_uri`も独自domainへ変わり、旧Worker hostを含まない。
+PC ChromeではLINEログイン後に`liff.state`から`/onboarding/satoyama`が復元され、
+無限待機やconsole errorなしで画面が開いた。
 
-### 残る本人操作
+実認証ユーザーで、初回回答、課題だけを変えた再回答、再訪時の最新回答復元を確認した。
+390×844では`scrollWidth=390`、1440×1000では`scrollWidth=1440`で横overflowはない。
+いずれもブラウザURLは`line.satoyama-ai-base.com`のままである。
 
-LINE DevelopersのLIFF endpointを、root pathを変えず次へ変更する必要がある。
+### 残る本人確認
 
-`https://line.satoyama-ai-base.com?liffId=2010452980-ng2A6Rna`
+RyoさんのiPhone LINE内ブラウザで、次の公開URLを再度開き、上部表示が
+`line.satoyama-ai-base.com`であることと、「読み込み中…」で停止しないことを確認する。
 
-現在はLINE Developersの本人ログイン画面で止まっている。endpoint変更後に公開LIFF URLから
-認可URLの`redirect_uri`が独自domainへ変わったことを確認し、RyoさんのiPhone LINE内で
-初回、再訪、3問、再回答、スキップを最終確認する。既存予約・フォームが同じLIFF IDを
-共有するため、endpointのpathは`/onboarding/satoyama`へ変更せずrootのままにする。
+`https://liff.line.me/2010452980-ng2A6Rna/onboarding/satoyama?liffId=2010452980-ng2A6Rna`
+
+既存予約・フォームが同じLIFF IDを共有するため、endpointのpathは
+`/onboarding/satoyama`へ変更せずrootのまま維持した。実ユーザーでのスキップ、
+ブロック・友だち解除は未確認であり、自動テストの確認結果と分けて記録する。
 
 ### hotfixのロールバック
 
