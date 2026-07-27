@@ -702,3 +702,29 @@ route内の専用Bearerで再認証する。外部送信、タグ変更、配信
 文面と時刻の正本は
 `apps/worker/src/features/satoyama-onboarding/followup-content.ts`、
 本番D1へ反映するSQL生成は`scripts/render-satoyama-followup-sql.ts`とする。
+
+### 本番反映
+
+scenario登録直前のD1 Time Travel bookmark:
+
+`000009e6-000000e6-000050b5-f2c2c278499eadbba9b61ba8ec432d35`
+
+最初に5本・15stepを`is_active=0`で登録し、account、課題タグ、3step、
+1日後・3日後・7日後、10:00 JSTが一致すること、登録者0件・配信予約0件を確認した。
+
+commit `fd9cdf7`のWorkerを本番version
+`7f7f6917-2c2a-4058-b698-b541d426b6ed`へ100%配備した。既存secret binding、
+D1、R2、Assets、5分・6時間cronが保持されている。公開canaryはオンボーディング画面200、
+認証なしAPI 401、既存予約入口200、フォーム入口200だった。
+
+有効化直前のD1 Time Travel bookmark:
+
+`000009e6-000000e8-000050b5-aa14b36635ea1fbe981ece1391ce817f`
+
+固定した5 scenarioだけを有効化し、変更件数5を確認した。有効化後も既存回答者の
+遡及登録は行わず、登録者0件・配信予約0件である。旧4通は`is_active=0`、
+進行中だった1件は`paused`かつ次回予約NULLのままである。
+
+有効化後のD1 Time Travel bookmark:
+
+`000009e6-000000ea-000050b5-67d7b4f2a4aa266d48364b687a07f937`
