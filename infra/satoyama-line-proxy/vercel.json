@@ -3,6 +3,10 @@
   "framework": null,
   "rewrites": [
     {
+      "source": "/",
+      "destination": "https://satoyama.r-inafuku.workers.dev/"
+    },
+    {
       "source": "/:path*",
       "destination": "https://satoyama.r-inafuku.workers.dev/:path*"
     }
