@@ -23,6 +23,7 @@ import {
 } from '../features/satoyama-onboarding/content.js';
 import { verifyLiffAccountCaller } from '../services/liff-auth.js';
 import { configuredSatoyamaAccountId } from '../services/satoyama-onboarding-reminder.js';
+import { syncSatoyamaFollowupScenario } from '../services/satoyama-followup-scenario.js';
 
 const satoyamaOnboarding = new Hono<Env>();
 
@@ -251,6 +252,11 @@ satoyamaOnboarding.post('/api/liff/onboarding/satoyama/submit', async (c) => {
       idempotencyKey: body.idempotencyKey,
       tags: SATOYAMA_ONBOARDING_TAGS,
       now: toJstString(new Date()),
+    });
+    await syncSatoyamaFollowupScenario(c.env.DB, {
+      lineAccountId: auth.caller.lineAccountId,
+      friendId: auth.caller.friend.id,
+      issue: body.issue,
     });
     return c.json({
       success: true,
