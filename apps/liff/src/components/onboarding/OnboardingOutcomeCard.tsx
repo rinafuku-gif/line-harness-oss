@@ -1,22 +1,27 @@
-import type { OnboardingOutcome } from '../../lib/onboarding-api.js';
-import { IssueBonusCard } from './IssueBonusCard.js';
+import type {
+  CommonBonus,
+  OnboardingOutcome,
+} from '../../lib/onboarding-api.js';
+import { StarterKitCard } from './StarterKitCard.js';
 
 interface OnboardingOutcomeCardProps {
   outcome: OnboardingOutcome;
+  commonBonus: CommonBonus;
   sending: boolean;
   actionMessage: string | null;
   onSendToChat: () => void;
-  onIssueBonusOpened: () => void;
+  onStarterKitOpened: () => void;
   onRestart: () => void;
   onClose: () => void;
 }
 
 export function OnboardingOutcomeCard({
   outcome,
+  commonBonus,
   sending,
   actionMessage,
   onSendToChat,
-  onIssueBonusOpened,
+  onStarterKitOpened,
   onRestart,
   onClose,
 }: OnboardingOutcomeCardProps) {
@@ -33,27 +38,35 @@ export function OnboardingOutcomeCard({
           <strong>{outcome.nextStep}</strong>
         </div>
 
-        <button
-          type="button"
-          className="primary-button"
-          onClick={onSendToChat}
-          disabled={sending}
-        >
-          {sending ? '準備しています…' : outcome.cta.label}
-        </button>
-        <p className="cta-note">
-          このボタンを押した時だけ、上の相談文をLINEトークへ送るか、コピーします。無料相談の予約は自動では始まりません。
-        </p>
-        {actionMessage ? (
-          <p className="action-message" role="status">
-            {actionMessage}
-          </p>
-        ) : null}
-
-        <IssueBonusCard
-          bonus={outcome.issueBonus}
-          onOpened={onIssueBonusOpened}
+        <StarterKitCard
+          bonus={commonBonus}
+          issueBonus={outcome.issueBonus}
+          onOpened={onStarterKitOpened}
         />
+
+        <section className="consultation-action" aria-labelledby="consultation-action-title">
+          <h2 id="consultation-action-title">一緒に整理したい場合</h2>
+          <p>
+            回答内容をもとに、LINEトークで相談文を送れます。
+            送信や予約が自動で始まることはありません。
+          </p>
+          <button
+            type="button"
+            className="primary-button"
+            onClick={onSendToChat}
+            disabled={sending}
+          >
+            {sending ? '準備しています…' : outcome.cta.label}
+          </button>
+          <p className="cta-note">
+            このボタンを押した時だけ、上の相談文をLINEトークへ送るか、コピーします。
+          </p>
+          {actionMessage ? (
+            <p className="action-message" role="status">
+              {actionMessage}
+            </p>
+          ) : null}
+        </section>
 
         <div className="footer-actions">
           <button type="button" className="text-button" onClick={onRestart}>

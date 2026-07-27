@@ -12,6 +12,7 @@
     "deploy:web": "pnpm --filter web build",
     "db:migrate": "wrangler d1 execute line-crm --file=packages/db/schema.sql",
     "db:migrate:local": "wrangler d1 execute line-crm --file=packages/db/schema.sql --local",
+    "canary:satoyama-onboarding:production": "tsx scripts/satoyama-onboarding-production-canary.ts",
     "deploy:setup": "node packages/create-line-harness/dist/index.js",
     "deploy:update": "node packages/create-line-harness/dist/index.js update",
     "test:scripts": "vitest run --config vitest.config.ts",

@@ -78,6 +78,7 @@ import { richMenuGroups } from './routes/rich-menu-groups.js';
 import adminVersion from './routes/admin-version.js';
 import adminUpdate from './routes/admin-update.js';
 import { satoyamaOnboarding } from './routes/satoyama-onboarding.js';
+import { satoyamaCustomers } from './routes/satoyama-customers.js';
 
 export type Env = {
   Bindings: {
@@ -133,6 +134,9 @@ export type Env = {
     // LIFFをWorkerと別originで配信する場合だけ設定する。オンボーディング
     // APIにのみ許可され、ADMIN_ORIGINの権限へは混ぜない。
     SATOYAMA_ONBOARDING_ORIGIN?: string;
+    // SATOYAMA Web管理画面から回答者一覧を読むためだけの専用Bearer。
+    // API_KEYとは分離し、未設定時は専用endpointを404で閉じる。
+    SATOYAMA_SITE_READ_TOKEN?: string;
     // Phase 5 self-update — consumed by /admin/update/*. Defaults live in
     // wrangler.toml [vars]; secrets (CF_API_TOKEN, ADMIN_API_KEY) come from
     // `wrangler secret put`. All are optional at the type level so the rest
@@ -224,6 +228,7 @@ app.route('/', dedupPreview);
 app.route('/', profileRefresh);
 app.route('/', richMenuGroups);
 app.route('/', satoyamaOnboarding);
+app.route('/', satoyamaCustomers);
 
 // Phase 5 (upgrade flow) — public build metadata endpoint. Mounted under
 // /admin/ but intentionally unauthenticated: the dashboard fetches /admin/version

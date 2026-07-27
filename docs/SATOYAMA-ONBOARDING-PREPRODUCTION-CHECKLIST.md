@@ -127,6 +127,12 @@
 
 ### Stage 2: 内部テスト
 
+- [ ] 本番の通常確認は`pnpm canary:satoyama-onboarding:production`とイントロ表示までに限定
+- [ ] 3問の書き込み確認はローカルpreview、または専用LINEテストユーザーで実施
+- [ ] 専用テストユーザーを使う場合、D1復元点、事前件数、対象account + friend + programを記録
+- [ ] 本番書き込みE2E後、同じ作業内でstate、event、`[SB]`タグ割当、`sb_*` metadataを限定クリーンアップ
+- [ ] 運営者本人・実利用者を本番書き込みE2Eに使っていない
+
 1. 対象SATOYAMA accountだけを設定する。
 2. テスト用ユーザーだけが開ける明示URLから、質問、スキップ、再回答を確認する。
 3. 別accountのIDトークン、未follow、期限切れ・不正トークンが拒否されることを確認する。

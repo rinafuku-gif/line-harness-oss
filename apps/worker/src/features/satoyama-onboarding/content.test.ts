@@ -43,6 +43,8 @@ describe('SATOYAMA onboarding content', () => {
 
   it('keeps bonus content versioned and free from unsupported results claims', () => {
     expect(COMMON_BONUS.version).toMatch(/^common-/);
+    expect(COMMON_BONUS.starterPlan).toHaveLength(4);
+    expect(COMMON_BONUS.usageRules).toHaveLength(3);
     expect(COMMON_BONUS.templates).toHaveLength(3);
     expect(COMMON_BONUS.note).toMatch(/個人情報|顧客|APIキー/);
     expect(Object.keys(ISSUE_BONUSES)).toEqual(ISSUE_OPTIONS.map((option) => option.code));

@@ -11,6 +11,7 @@ import {
   cancelSatoyamaOnboardingReminder,
   claimSatoyamaOnboardingReminder,
   getSatoyamaOnboardingState,
+  listSatoyamaCustomers,
   markSatoyamaOnboardingBonusOpened,
   markSatoyamaOnboardingCtaClicked,
   markSatoyamaOnboardingFollowState,
@@ -145,9 +146,18 @@ describe('SATOYAMA onboarding DB boundary', () => {
         id TEXT PRIMARY KEY,
         line_user_id TEXT UNIQUE NOT NULL,
         line_account_id TEXT REFERENCES line_accounts(id),
+        display_name TEXT,
+        picture_url TEXT,
         is_following INTEGER NOT NULL DEFAULT 1,
         metadata TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL DEFAULT 'before',
         updated_at TEXT NOT NULL
+      );
+      CREATE TABLE chats (
+        id TEXT PRIMARY KEY,
+        friend_id TEXT NOT NULL REFERENCES friends(id) ON DELETE CASCADE,
+        status TEXT NOT NULL,
+        created_at TEXT NOT NULL
       );
       CREATE TABLE tags (
         id TEXT PRIMARY KEY,
@@ -167,11 +177,11 @@ describe('SATOYAMA onboarding DB boundary', () => {
         ('account-1', 'channel-1', 'SATOYAMA', 'token-1', 'secret-1', 'liff-1'),
         ('account-2', 'channel-2', 'Other', 'token-2', 'secret-2', 'liff-2');
       INSERT INTO friends
-        (id, line_user_id, line_account_id, is_following, metadata, updated_at)
+        (id, line_user_id, line_account_id, display_name, picture_url, is_following, metadata, created_at, updated_at)
       VALUES
-        ('friend-1', 'U1', 'account-1', 1, '{"keep":"yes"}', 'before'),
-        ('friend-2', 'U2', 'account-2', 1, '{}', 'before'),
-        ('friend-3', 'U3', 'account-1', 1, '{}', 'before');
+        ('friend-1', 'U1', 'account-1', '山田 太郎', 'https://example.com/1.png', 1, '{"keep":"yes"}', '2026-07-20', 'before'),
+        ('friend-2', 'U2', 'account-2', '他アカウント', NULL, 1, '{}', '2026-07-20', 'before'),
+        ('friend-3', 'U3', 'account-1', '佐藤 花子', NULL, 1, '{}', '2026-07-21', 'before');
     `);
     sqlite.exec(migration);
     db = createD1(sqlite);
@@ -219,6 +229,64 @@ describe('SATOYAMA onboarding DB boundary', () => {
       cta_clicked_at: '2026-07-26T12:01:00.000+09:00',
       issue_bonus_opened_at: '2026-07-26T12:02:00.000+09:00',
     });
+  });
+
+  it('lists only the configured account and keeps unanswered friends visible', async () => {
+    await saveSatoyamaOnboardingAnswers(db, {
+      lineAccountId: 'account-1',
+      friendId: 'friend-1',
+      answers: { issue: 'automation', role: 'owner', area: 'admin' },
+      idempotencyKey: 'customer-list-0001',
+      tags,
+      now: '2026-07-26T12:00:00.000+09:00',
+    });
+    sqlite.exec(`
+      INSERT INTO chats (id, friend_id, status, created_at)
+      VALUES ('chat-1', 'friend-1', 'unread', '2026-07-26T12:01:00.000+09:00')
+    `);
+
+    const result = await listSatoyamaCustomers(db, {
+      lineAccountId: 'account-1',
+      limit: 20,
+    });
+
+    expect(result.total).toBe(2);
+    expect(result.summary).toEqual({
+      total: 2,
+      not_started: 1,
+      started: 0,
+      completed: 1,
+      skipped: 0,
+    });
+    expect(result.customers).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          friend_id: 'friend-1',
+          display_name: '山田 太郎',
+          status: 'completed',
+          issue_code: 'automation',
+          role_code: 'owner',
+          area_code: 'admin',
+          chat_status: 'unread',
+        }),
+        expect.objectContaining({
+          friend_id: 'friend-3',
+          display_name: '佐藤 花子',
+          status: 'not_started',
+          issue_code: null,
+        }),
+      ]),
+    );
+    expect(result.customers.some((customer) => customer.display_name === '他アカウント')).toBe(false);
+  });
+
+  it('filters customer answers without treating LIKE wildcards as input syntax', async () => {
+    const result = await listSatoyamaCustomers(db, {
+      lineAccountId: 'account-1',
+      search: '%',
+      status: 'not_started',
+    });
+    expect(result.total).toBe(0);
   });
 
   it('atomically stores 3 axes, preserves unrelated metadata, and attaches exactly 3 of 14 tags', async () => {
