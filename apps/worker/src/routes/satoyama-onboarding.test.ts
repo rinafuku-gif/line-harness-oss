@@ -5,6 +5,10 @@ vi.mock('../services/liff-auth.js', () => ({
   verifyLiffAccountCaller: vi.fn(),
 }));
 
+vi.mock('../services/satoyama-followup-scenario.js', () => ({
+  syncSatoyamaFollowupScenario: vi.fn(),
+}));
+
 vi.mock('@line-crm/db', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@line-crm/db')>();
   return {
@@ -27,6 +31,7 @@ import {
   saveSatoyamaOnboardingAnswers,
 } from '@line-crm/db';
 import { verifyLiffAccountCaller } from '../services/liff-auth.js';
+import { syncSatoyamaFollowupScenario } from '../services/satoyama-followup-scenario.js';
 import { satoyamaOnboarding } from './satoyama-onboarding.js';
 
 const completedState = {
@@ -92,6 +97,10 @@ beforeEach(() => {
   vi.mocked(saveSatoyamaOnboardingAnswers).mockResolvedValue({
     state: completedState,
     idempotentReplay: false,
+  });
+  vi.mocked(syncSatoyamaFollowupScenario).mockResolvedValue({
+    status: 'enrolled',
+    scenarioId: 'satoyama-onboarding-v1-handoff',
   });
   vi.mocked(markSatoyamaOnboardingQuestionsStarted).mockResolvedValue({
     ...completedState,
@@ -246,10 +255,46 @@ describe('SATOYAMA onboarding routes', () => {
         },
       }),
     );
+    expect(syncSatoyamaFollowupScenario).toHaveBeenCalledWith(
+      expect.anything(),
+      {
+        lineAccountId: 'account-satoyama',
+        friendId: 'friend-from-verified-token',
+        issue: 'handoff',
+      },
+    );
     const body = await response.json() as {
       data: { outcome: { cta: { message: string } } };
     };
     expect(body.data.outcome.cta.message).not.toMatch(/無料相談|予約/);
+  });
+
+  it('retries scenario synchronization on an idempotent answer replay', async () => {
+    vi.mocked(saveSatoyamaOnboardingAnswers).mockResolvedValue({
+      state: completedState,
+      idempotentReplay: true,
+    });
+
+    const response = await setup().request(
+      '/api/liff/onboarding/satoyama/submit?liffId=123456-test',
+      {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer token',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          issue: 'handoff',
+          role: 'internal_lead',
+          area: 'admin',
+          idempotencyKey: 'idem-000000000105',
+        }),
+      },
+      env(),
+    );
+
+    expect(response.status).toBe(200);
+    expect(syncSatoyamaFollowupScenario).toHaveBeenCalledOnce();
   });
 
   it('rejects unknown enum values before touching profile or tags', async () => {

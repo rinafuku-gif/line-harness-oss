@@ -653,3 +653,78 @@ route内の専用Bearerで再認証する。外部送信、タグ変更、配信
 
 本番反映時は専用tokenをCloudflare WorkerとSATOYAMA Webのサーバー環境へsecretとして
 同じ値で設定する。token値をブラウザbundle、Git、ログへ出さない。
+
+## 18. 2026年7月27日 旧シナリオ停止と3問回答後フォロー
+
+### 旧シナリオの停止
+
+本番D1を確認したところ、過去の個人・スクール向け方針で作られた
+`あいさつ（友だち追加）`が有効なまま残っていた。
+
+- 友だち追加直後、1日後、3日後、6日後の4通
+- 「ひとり経営の相棒」「5問・1分」「月額の会員」等、現在の中小企業向け方針と異なる文面
+- 旧Vercel hostの診断URL
+- SATOYAMA accountのfriend 1人に、2026年7月28日05:07 JSTの次回配信予約
+
+変更直前のD1 Time Travel bookmark:
+
+`000009e6-000000e0-000050b5-d0d3a99013a730d19bdbc0caf5f07ea1`
+
+対象scenario IDを固定して`is_active=0`にし、同scenarioで進行中だったSATOYAMA accountの
+1件だけを`paused`へ変更した。`next_delivery_at`はNULLにし、完了済み1件と他scenario、
+他account、メッセージ履歴は変更していない。
+
+### 3問回答後の課題別フォロー
+
+3問の1問目で選ばれた課題を起点に、次の5本を用意する。
+
+- 特定の人に仕事が集中している
+- 引き継ぎ・標準化を整えたい
+- AIを何から始めるか迷っている
+- 安全な利用ルールと進め方を整えたい
+- 具体的な業務を自動化・仕組み化したい
+
+各scenarioは回答の翌日・3日後・7日後の10:00 JSTに1通ずつ送る。回答直後はLIFF上で
+結果と特典を表示し、LINE pushを重ねない。2通目は回答内容に合ったスタートキットへの
+再訪、3通目はLINEトークでの相談または料金ページの確認につなぐ。
+
+安全条件は次のとおり。
+
+- SATOYAMA accountに紐づく固定scenario IDだけを対象にする
+- `tag_added`かつ現在の課題タグがfriendへ付いている時だけ登録する
+- 同じ回答の再送では二重登録しない
+- 回答する課題を変えた時は、以前の進行中scenarioを停止する
+- 以前に完了または停止した同じ課題のscenarioは自動で再開しない
+- 各配信直前にも課題タグの存在を確認し、タグが変わっていれば送信しない
+- 既存回答者を遡って自動登録しない
+- scenario設定が未作成・停止中・別account・タグ不一致の場合は配信を開始しない
+
+文面と時刻の正本は
+`apps/worker/src/features/satoyama-onboarding/followup-content.ts`、
+本番D1へ反映するSQL生成は`scripts/render-satoyama-followup-sql.ts`とする。
+
+### 本番反映
+
+scenario登録直前のD1 Time Travel bookmark:
+
+`000009e6-000000e6-000050b5-f2c2c278499eadbba9b61ba8ec432d35`
+
+最初に5本・15stepを`is_active=0`で登録し、account、課題タグ、3step、
+1日後・3日後・7日後、10:00 JSTが一致すること、登録者0件・配信予約0件を確認した。
+
+commit `fd9cdf7`のWorkerを本番version
+`7f7f6917-2c2a-4058-b698-b541d426b6ed`へ100%配備した。既存secret binding、
+D1、R2、Assets、5分・6時間cronが保持されている。公開canaryはオンボーディング画面200、
+認証なしAPI 401、既存予約入口200、フォーム入口200だった。
+
+有効化直前のD1 Time Travel bookmark:
+
+`000009e6-000000e8-000050b5-aa14b36635ea1fbe981ece1391ce817f`
+
+固定した5 scenarioだけを有効化し、変更件数5を確認した。有効化後も既存回答者の
+遡及登録は行わず、登録者0件・配信予約0件である。旧4通は`is_active=0`、
+進行中だった1件は`paused`かつ次回予約NULLのままである。
+
+有効化後のD1 Time Travel bookmark:
+
+`000009e6-000000ea-000050b5-67d7b4f2a4aa266d48364b687a07f937`
