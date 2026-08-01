@@ -962,14 +962,14 @@ function sessCard(r){
   var d=document.createElement('div');d.className='card c-w';
   var meta=r.location+'／'+r.menu_name+(r.phone?'　☎'+r.phone:'')+'　LINE:'+(r.display_name||'—');
   var h='<div class="card-body"><div class="card-head"><div class="card-name">'+r.who+'</div><span class="card-st st-w">要確認</span></div><div class="card-meta">'+meta+'</div><div class="hopes-list">';
-  (r.hopes||[]).forEach(function(hp,i){h+='<button class="btn-hope" onclick="cf(\''+r.id+'\','+i+')">第'+(i+1)+'希望　'+fmt(hp.date)+' '+hp.start+'　<b>この時間で確定</b></button>';});
-  h+='</div><div class="card-actions"><button class="btn btn-cancel" onclick="cx(\''+r.id+'\')">キャンセル</button></div></div>';
+  (r.hopes||[]).forEach(function(hp,i){h+='<button class="btn-hope" data-id="'+r.id+'" data-idx="'+i+'" onclick="cf(this.dataset.id,+this.dataset.idx)">第'+(i+1)+'希望　'+fmt(hp.date)+' '+hp.start+'　<b>この時間で確定</b></button>';});
+  h+='</div><div class="card-actions"><button class="btn btn-cancel" data-id="'+r.id+'" onclick="cx(this.dataset.id)">キャンセル</button></div></div>';
   d.innerHTML=h;return d;
 }
 function sessCardConf(r){
   var d=document.createElement('div');d.className='card c-c';
   var meta=r.location+'／'+r.menu_name+'　'+fmt(r.date,r.start_hm)+(r.phone?'　☎'+r.phone:'')+'　LINE:'+(r.display_name||'—');
-  var h='<div class="card-body"><div class="card-head"><div class="card-name">'+r.who+'</div><span class="card-st st-c">確定済み</span></div><div class="card-meta">'+meta+'</div><div class="card-actions"><button class="btn btn-remove" onclick="tgl(\''+r.id+'\')">時間を変更</button><button class="btn btn-cancel" onclick="cx(\''+r.id+'\')">キャンセル</button></div><div class="picker" id="rs-'+r.id+'" style="display:none"></div></div>';
+  var h='<div class="card-body"><div class="card-head"><div class="card-name">'+r.who+'</div><span class="card-st st-c">確定済み</span></div><div class="card-meta">'+meta+'</div><div class="card-actions"><button class="btn btn-remove" data-id="'+r.id+'" onclick="tgl(this.dataset.id)">時間を変更</button><button class="btn btn-cancel" data-id="'+r.id+'" onclick="cx(this.dataset.id)">キャンセル</button></div><div class="picker" id="rs-'+r.id+'" style="display:none"></div></div>';
   d.innerHTML=h;return d;
 }
 function renderWS(){
@@ -1005,8 +1005,8 @@ function wsCard(a,t){
   var stL={n:['st-n','新着'],w:['st-w','要確認'],c:['st-c','確定済み']}[t];
   var h='<div class="card-body"><div class="card-head"><div class="card-name">'+a.workshop_title+'</div><span class="card-st '+stL[0]+'">'+stL[1]+'</span></div><div class="card-meta">'+(a.date?fmt(a.date):'')+'　'+a.who+'　'+a.count+'名</div>';
   if(a.phone)h+='<div class="card-phone">📞 '+a.phone+'</div>';
-  if(t!=='c')h+='<div class="card-actions"><button class="btn btn-confirm" onclick="wsc(\''+a.id+'\')">確定する</button><button class="btn btn-cancel" onclick="wsx(\''+a.id+'\')">申込取消</button></div>';
-  else h+='<div class="card-actions"><button class="btn btn-remove" onclick="wsx(\''+a.id+'\')">取消・削除</button></div>';
+  if(t!=='c')h+='<div class="card-actions"><button class="btn btn-confirm" data-id="'+a.id+'" onclick="wsc(this.dataset.id)">確定する</button><button class="btn btn-cancel" data-id="'+a.id+'" onclick="wsx(this.dataset.id)">申込取消</button></div>';
+  else h+='<div class="card-actions"><button class="btn btn-remove" data-id="'+a.id+'" onclick="wsx(this.dataset.id)">取消・削除</button></div>';
   h+='</div>';
   d.innerHTML=h;return d;
 }
@@ -1043,7 +1043,7 @@ function tgl(id){
     if(!free.length)return;
     any=true;
     h+='<div style="font-size:.82rem;font-weight:600;color:var(--ac);margin:6px 0 2px">'+fmt(d.date)+'</div><div>';
-    free.forEach(function(s){h+='<button class="slotbtn" onclick="rs(\''+id+'\',\''+d.date+'\',\''+s.start+'\')">'+s.start+'</button>';});
+    free.forEach(function(s){h+='<button class="slotbtn" data-id="'+id+'" data-date="'+d.date+'" data-start="'+s.start+'" onclick="rs(this.dataset.id,this.dataset.date,this.dataset.start)">'+s.start+'</button>';});
     h+='</div>';
   });
   if(!any)h+='<div class="empty">変更できる空き枠がありません。</div>';
