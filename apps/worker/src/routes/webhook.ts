@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
-import { verifySignature, LineClient } from '@line-crm/line-sdk';
-import type { WebhookRequestBody, WebhookEvent, TextEventMessage } from '@line-crm/line-sdk';
+import { verifySignature, LineClient, quickReply, withQuickReply } from '@line-crm/line-sdk';
+import type { WebhookRequestBody, WebhookEvent, TextEventMessage, Message, QuickReply } from '@line-crm/line-sdk';
 import { createStickerMessageContent } from '@line-crm/shared';
 import {
   upsertFriend,
@@ -23,7 +23,49 @@ import {
 import type { EntryRoute, Friend } from '@line-crm/db';
 import { fireEvent } from '../services/event-bus.js';
 import { buildMessage, expandVariables } from '../services/step-delivery.js';
+import { invokeLLM, isConsultationRateLimited } from '../services/llm.js';
+import { buildConsultationPrompt, CONSULTATION_FALLBACK_MESSAGE } from '../services/consultationPrompt.js';
+import { isOwnerLineUserId, resolveOwnerCommandReply } from '../services/owner-commands.js';
+import { redactAdminMagicLinkForLog } from '../services/adminMagicLink.js';
+import {
+  isChatParityEnabled,
+  invokeChatBackend,
+  fetchBookingSlots,
+  submitBooking,
+  formatSlotLabel,
+  formatDayLabel,
+  buildSlotPickerFlexContents,
+  buildDayPickerFlexContents,
+  parseSlotPostbackData,
+  parseDayPostbackData,
+  groupSlotsByJstDay,
+  filterSlotsByJstDay,
+  buildQuickReplyItems,
+  isExplicitBookingIntent,
+  resolveQuickReplyOptions,
+  QUICK_REPLY_LABEL_MAX_LENGTH,
+  type BookingSlot,
+} from '../services/chatBackend.js';
+import {
+  getChatBookingSession,
+  upsertChatBookingSession,
+  clearChatBookingSession,
+  type ChatBookingSession,
+} from '../services/chatBookingSession.js';
+import {
+  cancelFriendOnboardingReminder,
+  scheduleFriendOnboardingReminder,
+  type SatoyamaOnboardingRuntimeConfig,
+} from '../services/satoyama-onboarding-reminder.js';
 import type { Env } from '../index.js';
+
+/** webhook.ts 内から handleEvent 系関数へ渡す、外部チャットバックエンド関連の env 束。 */
+interface ChatBackendEnv {
+  backendUrl?: string;
+  backendSecret?: string;
+  testUserIds?: string;
+  parityEnabled?: string;
+}
 
 const webhook = new Hono<Env>();
 
@@ -32,6 +74,13 @@ const webhook = new Hono<Env>();
 // bursty batched deliveries (~100 events × ~5 KB) while still well below the
 // 128 MB Cloudflare Workers memory ceiling.
 const MAX_WEBHOOK_BODY_SIZE = 1024 * 1024; // 1 MiB
+
+// テキストメッセージ受信直後に出す LINE ローディングアニメーションの表示秒数。
+// 相談窓口 AI 一次応答 (Gemini) の生成待ち体感を改善する目的 (体感速度対策)。
+// 実際の表示は「生成完了 (= 返信メッセージ到着)」または本値の経過のどちらか早い方で
+// 消えるため (LINE 仕様)、長めに倒しても生成が速く終われば長く表示され続けることはない。
+// 現状の実測 (30秒程度) をカバーしつつ LINE 仕様の上限 (60秒) に収める値として 30 とする。
+const LOADING_ANIMATION_SECONDS = 30;
 
 async function ensureFriendFromWebhookUser(
   db: D1Database,
@@ -71,6 +120,445 @@ async function ensureFriendFromWebhookUser(
   }
 
   return friend;
+}
+
+// ─── チャット駆動予約フロー（外部チャットバックエンド連携） ─────────────────
+//
+// 空き枠提示 → 日時選択(postback) → 氏名/メール収集(text) → 確定 の一連の流れを
+// 扱うヘルパー群。会話状態は services/chatBookingSession.ts (D1) が正本、
+// AI応答そのものは外部バックエンド (services/chatBackend.ts) が正本。
+
+async function logOutgoingMessage(
+  db: D1Database,
+  friendId: string,
+  payload: { messageType: string; content: string },
+  source: string,
+): Promise<void> {
+  try {
+    await db
+      .prepare(
+        `INSERT INTO messages_log (id, friend_id, direction, message_type, content, broadcast_id, scenario_step_id, delivery_type, source, created_at)
+         VALUES (?, ?, 'outgoing', ?, ?, NULL, NULL, 'reply', ?, ?)`,
+      )
+      .bind(crypto.randomUUID(), friendId, payload.messageType, payload.content, source, jstNow())
+      .run();
+  } catch (err) {
+    console.error('[webhook] failed to log outgoing chat-booking message', err);
+  }
+}
+
+async function sendReplyAndLog(
+  lineClient: LineClient,
+  db: D1Database,
+  friendId: string,
+  replyToken: string,
+  messages: Message[],
+  source: string,
+): Promise<void> {
+  await lineClient.replyMessage(replyToken, messages);
+  const { messageToLogPayload } = await import('../services/step-delivery.js');
+  for (const msg of messages) {
+    await logOutgoingMessage(db, friendId, messageToLogPayload(msg), source);
+  }
+}
+
+/**
+ * 名前入力ステップのワンタップ化（2026-07-18追加）。
+ *
+ * 背景（Ryo実機の指摘）: 予約フロー中にリッチメニューが開いたままだと入力欄が
+ * 隠れてタイピングに詰まる（LINE仕様: メニューは開いたままタップ後も残る）。
+ * 友だち登録時点で取得済みの表示名を、LINEプロフィールAPIから改めて取得し直し
+ * （その場でユーザーが名前を変えている可能性を考慮し、DBキャッシュではなく最新値を
+ * 都度取る）、「タップするだけで送信される」クイックリプライボタンを1件だけ添える。
+ * 手入力の経路は一切変更しない（ボタンはタップ時にボタンのラベル文字列がそのまま
+ * ユーザー発言として送信されるだけで、既存の awaiting_name ステップの文字数検証を
+ * そのまま通る）。
+ *
+ * フェイルオープン: プロフィール取得に失敗した場合・displayNameが空の場合は
+ * undefined を返す。呼び出し元はその場合クイックリプライを添えず、従来通り
+ * 自由入力のみのメッセージで送る（予約フロー自体を止めない）。
+ */
+async function buildNameQuickReplyBestEffort(
+  lineClient: LineClient,
+  lineUserId: string,
+): Promise<QuickReply | undefined> {
+  try {
+    const profile = await lineClient.getProfile(lineUserId);
+    const displayName = profile.displayName?.trim();
+    if (!displayName) return undefined;
+    const label =
+      displayName.length > QUICK_REPLY_LABEL_MAX_LENGTH
+        ? displayName.slice(0, QUICK_REPLY_LABEL_MAX_LENGTH)
+        : displayName;
+    return quickReply([{ type: 'action', action: { type: 'message', label, text: displayName } }]);
+  } catch (err) {
+    console.error('[webhook] failed to fetch profile for name quick reply (fail-open: free text only)', err);
+    return undefined;
+  }
+}
+
+/**
+ * メール入力ステップのワンタップ化（2026-07-18追加）。メールは既にオプショナル
+ * （「なし」等 CHAT_BOOKING_NO_EMAIL_KEYWORDS を送ると省略できる）なので、その先頭
+ * 語彙をそのままタップ送信文言にしたボタンを添えるだけで済む。新しい語彙・分岐は
+ * 増やさない（＝必須項目化/省略可能項目の追加は行わない。仕様は不変）。
+ */
+function buildSkipEmailQuickReply(): QuickReply {
+  return quickReply([
+    {
+      type: 'action',
+      action: { type: 'message', label: 'メールなしで進む', text: CHAT_BOOKING_NO_EMAIL_KEYWORDS[0] },
+    },
+  ]);
+}
+
+/** 日時選択(postback)を受けた直後の処理。氏名が既知(409再選択等)ならメール収集へ直行する。 */
+async function handleChatBookingSlotSelection(
+  db: D1Database,
+  lineClient: LineClient,
+  replyToken: string,
+  friend: Friend,
+  slot: BookingSlot,
+): Promise<void> {
+  const session = await getChatBookingSession(db, friend.id);
+  const label = formatSlotLabel(slot.start);
+
+  if (session?.name) {
+    await upsertChatBookingSession(db, friend.id, {
+      state: 'awaiting_email',
+      selectedStart: slot.start,
+      selectedEnd: slot.end,
+    });
+    const msg = withQuickReply(
+      buildMessage(
+        'text',
+        `${label} で承ります。\nメールアドレスは分かりますか？（確認メールをお送りします。なければ「なし」とお送りください）`,
+      ),
+      buildSkipEmailQuickReply(),
+    );
+    await sendReplyAndLog(lineClient, db, friend.id, replyToken, [msg], 'chat_booking_flow');
+    return;
+  }
+
+  await upsertChatBookingSession(db, friend.id, {
+    state: 'awaiting_name',
+    selectedStart: slot.start,
+    selectedEnd: slot.end,
+  });
+  const nameMsg = buildMessage('text', `${label} で承ります。\nお名前を教えてください。`);
+  const nameQuickReply = await buildNameQuickReplyBestEffort(lineClient, friend.line_user_id);
+  const finalNameMsg = nameQuickReply ? withQuickReply(nameMsg, nameQuickReply) : nameMsg;
+  await sendReplyAndLog(lineClient, db, friend.id, replyToken, [finalNameMsg], 'chat_booking_flow');
+}
+
+/**
+ * 「①日にちを選ぶ→②その日の時間を選ぶ」の1段目（CHATBOOK_DAY: postback）を処理する。
+ * 空き枠取得APIは常に14日分のフラット配列を返す契約のため、ここで毎回
+ * fetchBookingSlots() を呼び直してから filterSlotsByJstDay() で該当日だけに絞り込む
+ * （日付選択の間に他の人が予約して枠が減っている可能性があるため、キャッシュせず
+ * 都度取得するのが安全側）。
+ */
+async function handleChatBookingDaySelection(
+  db: D1Database,
+  lineClient: LineClient,
+  replyToken: string,
+  friend: Friend,
+  dateKey: string,
+  chatEnv: Pick<ChatBackendEnv, 'backendUrl' | 'backendSecret'>,
+): Promise<void> {
+  if (!chatEnv.backendUrl || !chatEnv.backendSecret) {
+    const msg = buildMessage('text', '只今予約処理を行えませんでした。お手数ですが担当者へ直接ご連絡ください。');
+    await sendReplyAndLog(lineClient, db, friend.id, replyToken, [msg], 'chat_booking_flow');
+    return;
+  }
+
+  const slotsResult = await fetchBookingSlots({
+    backendUrl: chatEnv.backendUrl,
+    backendSecret: chatEnv.backendSecret,
+  });
+
+  if (!slotsResult.ok || slotsResult.slots.length === 0) {
+    await clearChatBookingSession(db, friend.id);
+    const msg = buildMessage(
+      'text',
+      'あいにく、ただいま空いている日時がございません。恐れ入りますが、担当者からのご連絡をお待ちください。',
+    );
+    await sendReplyAndLog(lineClient, db, friend.id, replyToken, [msg], 'chat_booking_flow');
+    return;
+  }
+
+  const daySlots = filterSlotsByJstDay(slotsResult.slots, dateKey);
+
+  if (daySlots.length === 0) {
+    // 日付選択ボタンをタップするまでの間に、その日の枠が別の人に埋まってしまった
+    // ケース（レース）。エラーで終わらせず、最新の日付一覧を出して選び直させる。
+    const dayGroups = groupSlotsByJstDay(slotsResult.slots);
+    if (dayGroups.length === 0) {
+      await clearChatBookingSession(db, friend.id);
+      const msg = buildMessage(
+        'text',
+        'あいにく、ただいま空いている日時がございません。恐れ入りますが、担当者からのご連絡をお待ちください。',
+      );
+      await sendReplyAndLog(lineClient, db, friend.id, replyToken, [msg], 'chat_booking_flow');
+      return;
+    }
+    await upsertChatBookingSession(db, friend.id, { state: 'awaiting_slot_selection' });
+    const textMsg = buildMessage(
+      'text',
+      'せっかくお選びいただきましたが、その日はちょうど埋まってしまったようです。改めて空いている日をお送りします。',
+    );
+    const flexMsg = buildMessage(
+      'flex',
+      JSON.stringify(buildDayPickerFlexContents(dayGroups)),
+      'ご希望の日を選択してください',
+    );
+    await sendReplyAndLog(lineClient, db, friend.id, replyToken, [textMsg, flexMsg], 'chat_booking_flow');
+    return;
+  }
+
+  await upsertChatBookingSession(db, friend.id, { state: 'awaiting_slot_selection' });
+  const label = formatDayLabel(dateKey);
+  const flexMsg = buildMessage(
+    'flex',
+    JSON.stringify(buildSlotPickerFlexContents(daySlots, label)),
+    `${label}の空いている時間を選択してください`,
+  );
+  await sendReplyAndLog(lineClient, db, friend.id, replyToken, [flexMsg], 'chat_booking_flow');
+}
+
+/**
+ * ユーザー起点の予約導線（STEP1・2026-07-17追加）の入口。空き枠を取得し、日付ピッカー
+ * Flexを組み立てて messagesToSend の末尾に追加する（旧・chat parity book=true 即時分岐と
+ * ほぼ同じロジックを関数化。空き枠0件時に理由テキストを添えるようにした点のみ差分）。
+ * 呼び出し元: handleEvent内、ユーザーが isExplicitBookingIntent() に該当するメッセージを
+ * 送った場合のみ（AIの book 判定には一切依存しない）。
+ */
+async function appendDayPickerFlexIfAvailable(
+  db: D1Database,
+  friend: Friend,
+  messagesToSend: Message[],
+  chatEnv: Pick<ChatBackendEnv, 'backendUrl' | 'backendSecret'>,
+): Promise<void> {
+  if (!chatEnv.backendUrl || !chatEnv.backendSecret) return;
+
+  const slotsResult = await fetchBookingSlots({
+    backendUrl: chatEnv.backendUrl,
+    backendSecret: chatEnv.backendSecret,
+  });
+  const dayGroups = slotsResult.ok ? groupSlotsByJstDay(slotsResult.slots) : [];
+  if (slotsResult.ok && dayGroups.length > 0) {
+    messagesToSend.push(
+      buildMessage('flex', JSON.stringify(buildDayPickerFlexContents(dayGroups)), 'ご希望の日を選択してください'),
+    );
+    await upsertChatBookingSession(db, friend.id, { state: 'awaiting_slot_selection' });
+  } else if (slotsResult.ok) {
+    // 空き枠0件 — フローには入らず、担当者フォローに委ねる。呼び出し元の先頭メッセージ
+    // （「ご希望の日を選んでください」）だけで終わらせず、理由が分かるテキストを添える。
+    console.log(`[webhook] booking entry: no slots available friendId=${friend.id}`);
+    messagesToSend.push(
+      buildMessage('text', 'あいにく、ただいま空いている日時がございません。恐れ入りますが、担当者からのご連絡をお待ちください。'),
+    );
+  } else if (slotsResult.reason === 'not_configured' && slotsResult.message) {
+    messagesToSend.push(buildMessage('text', slotsResult.message));
+  } else {
+    console.error('[webhook] booking entry: slots fetch failed', slotsResult);
+  }
+}
+
+/**
+ * 完全リセット語 — 予約サブフロー（chatBookingSession・このリポジトリのD1）と、
+ * AI相談の会話記憶（satoyama側 conversations テーブル）の**両方**をクリアする。
+ *
+ * 2026-07-17 修正（実機バグ: 予約枠選択中に「リセット」と送っても無視され、
+ * 「上に表示された候補からタップして…」に吸われる事故）。旧版は「最初から」
+ * 「キャンセル」しか認識しておらず「リセット」が抜けていた。
+ *
+ * satoyama側（server/_core/lineChatRoute.ts の CONVERSATION_RESET_COMMANDS）と
+ * 語彙を完全一致させてある — 通常会話中（chatBookingSessionが無い状態）の
+ * これらの語は isExplicitBookingIntent() に一致せず invokeChatBackend() を素通しで
+ * 呼ぶため、satoyama側が自然に会話記憶をリセットする。一方この配列は「予約サブ
+ * フロー進行中はここ (handleChatBookingTextStep) が先に処理し invokeChatBackend() を
+ * 一切呼ばない」ため、予約中のリセットではローカルのセッションクリアに加えて
+ * 明示的に resetBackendConversationBestEffort() を呼び、AI側の記憶も揃えて消す。
+ * 変更する場合は両リポジトリを同時に直すこと（片方だけ増減すると「予約中は
+ * リセットが効くのに通常会話では効かない」ような状態差異が起きる）。
+ */
+const CHAT_BOOKING_FULL_RESET_COMMANDS = [
+  'リセット',
+  '最初から',
+  'はじめから',
+  '会話をリセット',
+  '最初からやり直す',
+  '最初からやり直したい',
+];
+/** 予約サブフローだけをキャンセルする表現。AI相談の会話記憶までは消さない。 */
+const CHAT_BOOKING_CANCEL_ONLY_COMMANDS = ['キャンセル'];
+const CHAT_BOOKING_NO_EMAIL_KEYWORDS = ['なし', 'ない', '無し', 'skip', 'スキップ'];
+
+/**
+ * 予約サブフロー進行中に完全リセット語を受け取った場合、satoyama側のAI相談の
+ * 会話記憶もベストエフォートでクリアする（CHAT_BOOKING_FULL_RESET_COMMANDS の
+ * コメント参照）。バックエンド未設定・呼び出し失敗時は静かに諦める — ローカルの
+ * 予約セッションクリアは呼び出し元で既に完了させる前提のため、ここが失敗しても
+ * ユーザーへの返信（予約フロー向け定型文）は必ず届く。
+ */
+async function resetBackendConversationBestEffort(
+  chatEnv: Pick<ChatBackendEnv, 'backendUrl' | 'backendSecret'>,
+  lineUserId: string,
+  resetText: string,
+): Promise<void> {
+  if (!chatEnv.backendUrl || !chatEnv.backendSecret) return;
+  try {
+    await invokeChatBackend({
+      backendUrl: chatEnv.backendUrl,
+      backendSecret: chatEnv.backendSecret,
+      lineUserId,
+      message: resetText,
+    });
+  } catch (err) {
+    console.error('[webhook] best-effort backend conversation reset failed', err);
+  }
+}
+
+/** セッション進行中に届いたテキストメッセージ（氏名/メール入力・リセット・迷子ガード）を処理する。 */
+async function handleChatBookingTextStep(
+  db: D1Database,
+  lineClient: LineClient,
+  replyToken: string,
+  friend: Friend,
+  session: ChatBookingSession,
+  chatEnv: Pick<ChatBackendEnv, 'backendUrl' | 'backendSecret'>,
+  incomingText: string,
+): Promise<void> {
+  const trimmed = incomingText.trim();
+
+  const isFullReset = CHAT_BOOKING_FULL_RESET_COMMANDS.includes(trimmed);
+  if (isFullReset || CHAT_BOOKING_CANCEL_ONLY_COMMANDS.includes(trimmed)) {
+    await clearChatBookingSession(db, friend.id);
+    if (isFullReset) {
+      await resetBackendConversationBestEffort(chatEnv, friend.line_user_id, trimmed);
+    }
+    const msg = buildMessage(
+      'text',
+      '予約の入力を最初からやり直します。改めて「無料相談を予約したい」とお送りください。',
+    );
+    await sendReplyAndLog(lineClient, db, friend.id, replyToken, [msg], 'chat_booking_flow');
+    return;
+  }
+
+  if (session.state === 'awaiting_slot_selection') {
+    const msg = buildMessage(
+      'text',
+      '上に表示された候補からタップして日時を選んでください。\nやり直す場合は「最初から」とお送りください。',
+    );
+    await sendReplyAndLog(lineClient, db, friend.id, replyToken, [msg], 'chat_booking_flow');
+    return;
+  }
+
+  if (session.state === 'awaiting_name') {
+    if (trimmed.length < 1 || trimmed.length > 255) {
+      const retryMsg = buildMessage('text', 'お名前を1〜255文字で教えてください。');
+      const nameQuickReply = await buildNameQuickReplyBestEffort(lineClient, friend.line_user_id);
+      const finalRetryMsg = nameQuickReply ? withQuickReply(retryMsg, nameQuickReply) : retryMsg;
+      await sendReplyAndLog(lineClient, db, friend.id, replyToken, [finalRetryMsg], 'chat_booking_flow');
+      return;
+    }
+    await upsertChatBookingSession(db, friend.id, { state: 'awaiting_email', name: trimmed });
+    const msg = withQuickReply(
+      buildMessage(
+        'text',
+        'メールアドレスは分かりますか？（確認メールをお送りします。なければ「なし」とお送りください）',
+      ),
+      buildSkipEmailQuickReply(),
+    );
+    await sendReplyAndLog(lineClient, db, friend.id, replyToken, [msg], 'chat_booking_flow');
+    return;
+  }
+
+  // state === 'awaiting_email'
+  if (!session.selectedStart || !session.name) {
+    // 想定外の状態崩れ（バグ防御）。安全にリセットしてやり直しを促す。
+    await clearChatBookingSession(db, friend.id);
+    const msg = buildMessage(
+      'text',
+      '入力内容を確認できませんでした。恐れ入りますが「無料相談を予約したい」と改めてお送りください。',
+    );
+    await sendReplyAndLog(lineClient, db, friend.id, replyToken, [msg], 'chat_booking_flow');
+    return;
+  }
+
+  if (!chatEnv.backendUrl || !chatEnv.backendSecret) {
+    await clearChatBookingSession(db, friend.id);
+    const msg = buildMessage('text', '只今予約処理を行えませんでした。お手数ですが担当者へ直接ご連絡ください。');
+    await sendReplyAndLog(lineClient, db, friend.id, replyToken, [msg], 'chat_booking_flow');
+    return;
+  }
+
+  const email = CHAT_BOOKING_NO_EMAIL_KEYWORDS.includes(trimmed) ? undefined : trimmed;
+
+  const result = await submitBooking({
+    backendUrl: chatEnv.backendUrl,
+    backendSecret: chatEnv.backendSecret,
+    start: session.selectedStart,
+    name: session.name,
+    email,
+    lineUserId: friend.line_user_id,
+  });
+
+  if (result.success) {
+    await clearChatBookingSession(db, friend.id);
+    const label = formatSlotLabel(result.start);
+    const meetLine = result.meetLink
+      ? `オンライン相談リンク: ${result.meetLink}`
+      : '相談方法は担当者から改めてご連絡します。';
+    const msg = buildMessage(
+      'text',
+      `ご予約を承りました。\n\n日時: ${label}\n${meetLine}\n\nご不明点があれば、このトーク画面からいつでもご連絡ください。`,
+    );
+    await sendReplyAndLog(lineClient, db, friend.id, replyToken, [msg], 'chat_booking_flow');
+    return;
+  }
+
+  if (result.code === 'slot_taken') {
+    const slotsResult = await fetchBookingSlots({
+      backendUrl: chatEnv.backendUrl,
+      backendSecret: chatEnv.backendSecret,
+    });
+    const dayGroups = slotsResult.ok ? groupSlotsByJstDay(slotsResult.slots) : [];
+    if (slotsResult.ok && dayGroups.length > 0) {
+      await upsertChatBookingSession(db, friend.id, {
+        state: 'awaiting_slot_selection',
+        selectedStart: null,
+        selectedEnd: null,
+      });
+      const textMsg = buildMessage(
+        'text',
+        'せっかくお選びいただきましたが、その枠はちょうど埋まってしまったようです。改めて空いている日をお送りします。',
+      );
+      const flexMsg = buildMessage(
+        'flex',
+        JSON.stringify(buildDayPickerFlexContents(dayGroups)),
+        'ご希望の日を選択してください',
+      );
+      await sendReplyAndLog(lineClient, db, friend.id, replyToken, [textMsg, flexMsg], 'chat_booking_flow');
+    } else {
+      await clearChatBookingSession(db, friend.id);
+      const msg = buildMessage(
+        'text',
+        'せっかくお選びいただきましたが、その枠はちょうど埋まってしまったようです。恐れ入りますが、改めて「無料相談を予約したい」とお送りください。',
+      );
+      await sendReplyAndLog(lineClient, db, friend.id, replyToken, [msg], 'chat_booking_flow');
+    }
+    return;
+  }
+
+  await clearChatBookingSession(db, friend.id);
+  const errorText =
+    result.code === 'not_configured'
+      ? '現在、オンラインでの予約受付を停止しております。恐れ入りますが、担当者からのご連絡をお待ちください。'
+      : '只今予約処理でエラーが発生しました。お手数ですが、少し時間をおいて改めてお試しください。';
+  const msg = buildMessage('text', errorText);
+  await sendReplyAndLog(lineClient, db, friend.id, replyToken, [msg], 'chat_booking_flow');
 }
 
 webhook.post('/webhook', async (c) => {
@@ -162,9 +650,15 @@ webhook.post('/webhook', async (c) => {
 
   // 非同期処理 — LINE は ~1s 以内のレスポンスを要求
   const processingPromise = (async () => {
+    const chatBackendEnv: ChatBackendEnv = {
+      backendUrl: c.env.CHAT_BACKEND_URL,
+      backendSecret: c.env.CHAT_BACKEND_SECRET,
+      testUserIds: c.env.CHAT_PARITY_TEST_USER_IDS,
+      parityEnabled: c.env.CHAT_PARITY_ENABLED,
+    };
     for (const event of body.events) {
       try {
-        await handleEvent(db, lineClient, event, channelAccessToken, matchedAccountId, c.env.WORKER_URL || new URL(c.req.url).origin, c.env.LIFF_URL, c.env.IMAGES);
+        await handleEvent(db, lineClient, event, channelAccessToken, matchedAccountId, c.env.WORKER_URL || new URL(c.req.url).origin, c.env.LIFF_URL, c.env.IMAGES, c.env.GEMINI_API_KEY, c.env.OWNER_LINE_USER_IDS, chatBackendEnv, c.env);
       } catch (err) {
         console.error('Error handling webhook event:', err);
       }
@@ -185,23 +679,27 @@ async function handleEvent(
   workerUrl?: string,
   liffUrl?: string,
   r2?: R2Bucket,
+  geminiApiKey?: string,
+  ownerLineUserIds?: string,
+  chatBackendEnv: ChatBackendEnv = {},
+  onboardingEnv: SatoyamaOnboardingRuntimeConfig = {},
 ): Promise<void> {
   if (event.type === 'follow') {
     const userId =
       event.source.type === 'user' ? event.source.userId : undefined;
     if (!userId) return;
 
-    console.log(`[follow] userId=${userId} lineAccountId=${lineAccountId}`);
+    console.log(`[follow] event received accountConfigured=${Boolean(lineAccountId)}`);
 
     // プロフィール取得 & 友だち登録/更新
     let profile;
     try {
       profile = await lineClient.getProfile(userId);
-    } catch (err) {
-      console.error('Failed to get profile for', userId, err);
+    } catch {
+      console.error('[follow] profile fetch failed');
     }
 
-    console.log(`[follow] profile=${profile?.displayName ?? 'null'}`);
+    console.log(`[follow] profileFetched=${Boolean(profile)}`);
 
     const friend = await upsertFriend(db, {
       lineUserId: userId,
@@ -210,13 +708,25 @@ async function handleEvent(
       statusMessage: profile?.statusMessage ?? null,
     });
 
-    console.log(`[follow] friend.id=${friend.id} friend.line_account_id=${(friend as any).line_account_id}`);
+    console.log('[follow] friend upserted');
 
     // Set line_account_id for multi-account tracking (always update on follow)
     if (lineAccountId) {
       await db.prepare('UPDATE friends SET line_account_id = ?, updated_at = ? WHERE id = ?')
         .bind(lineAccountId, jstNow(), friend.id).run();
-      console.log(`[follow] line_account_id set to ${lineAccountId} for friend ${friend.id}`);
+      console.log('[follow] account boundary recorded');
+    }
+
+    // SATOYAMA onboarding is disabled by default and account-gated. Failure to
+    // schedule the optional reminder must never break normal friend-add flows.
+    try {
+      await scheduleFriendOnboardingReminder(db, {
+        lineAccountId,
+        friendId: friend.id,
+        env: onboardingEnv,
+      });
+    } catch {
+      console.error('[satoyama-onboarding] reminder schedule failed');
     }
 
     // Resolve referral link (entry_route) for this friend.
@@ -370,7 +880,19 @@ async function handleEvent(
       event.source.type === 'user' ? event.source.userId : undefined;
     if (!userId) return;
 
+    const friend = await getFriendByLineUserId(db, userId);
     await updateFriendFollowStatus(db, userId, false);
+    if (friend) {
+      try {
+        await cancelFriendOnboardingReminder(db, {
+          lineAccountId: lineAccountId ?? friend.line_account_id,
+          friendId: friend.id,
+          env: onboardingEnv,
+        });
+      } catch {
+        console.error('[satoyama-onboarding] reminder cancellation failed');
+      }
+    }
     return;
   }
 
@@ -414,6 +936,35 @@ async function handleEvent(
         .run();
     } catch (err) {
       console.error('Failed to log incoming postback', err);
+    }
+
+    // チャット駆動予約フロー — 空き枠選択ボタンの postback は auto_replies を通さず
+    // 専用ハンドラで処理する（氏名/メール収集ステップへ進める）。
+    const chatBookingSlot = parseSlotPostbackData(postbackData);
+    if (chatBookingSlot) {
+      try {
+        await handleChatBookingSlotSelection(db, lineClient, event.replyToken, friend, chatBookingSlot);
+      } catch (err) {
+        console.error('[webhook] chat booking slot selection failed', err);
+        await clearChatBookingSession(db, friend.id).catch(() => undefined);
+      }
+      return;
+    }
+
+    // チャット駆動予約フロー — 日付選択ボタン（1段目）の postback。その日の時間枠
+    // 一覧（2段目）を返す。同じく auto_replies は通さない。
+    const chatBookingDay = parseDayPostbackData(postbackData);
+    if (chatBookingDay) {
+      try {
+        await handleChatBookingDaySelection(db, lineClient, event.replyToken, friend, chatBookingDay, {
+          backendUrl: chatBackendEnv.backendUrl,
+          backendSecret: chatBackendEnv.backendSecret,
+        });
+      } catch (err) {
+        console.error('[webhook] chat booking day selection failed', err);
+        await clearChatBookingSession(db, friend.id).catch(() => undefined);
+      }
+      return;
     }
 
     for (const rule of autoReplies.results) {
@@ -525,6 +1076,17 @@ async function handleEvent(
       event.source.type === 'user' ? event.source.userId : undefined;
     if (!userId) return;
 
+    // 受信直後・Gemini呼び出し前にローディングアニメーションを出す（体感速度対策）。
+    // fire-and-forget: メイン処理の待ち時間には入れない。1:1トーク限定の LINE 仕様
+    // なので失敗しても本処理には影響させず、ログのみ残す。
+    try {
+      void lineClient.startLoadingAnimation(userId, LOADING_ANIMATION_SECONDS).catch((err) => {
+        console.error('[webhook] loading animation failed', err);
+      });
+    } catch (err) {
+      console.error('[webhook] loading animation failed (sync)', err);
+    }
+
     const friend = await ensureFriendFromWebhookUser(db, lineClient, userId, lineAccountId);
     if (!friend) return;
 
@@ -540,6 +1102,38 @@ async function handleEvent(
       )
       .bind(logId, friend.id, incomingText, now)
       .run();
+
+    // オーナーコマンド: OWNER_LINE_USER_IDS に登録された送信者だけが対象。
+    // 非オーナーは isOwnerLineUserId() で弾かれ、以降の通常処理 (体験トリガー/自動返信/
+    // AI一次応答) にそのままフォールスルーする — コマンドの存在自体を漏らさないため。
+    // 「管理画面」は動的コマンド（SATOYAMA側のワンタイム入場リンクを発行するAPIを叩く。
+    // 詳細: services/adminMagicLink.ts）。CHAT_BACKEND_URL/SECRET は外部チャット
+    // バックエンド連携と同じ wrangler secret を再利用する。
+    if (isOwnerLineUserId(userId, ownerLineUserIds)) {
+      const ownerReply = await resolveOwnerCommandReply(incomingText, {
+        backendUrl: chatBackendEnv.backendUrl,
+        backendSecret: chatBackendEnv.backendSecret,
+      });
+      if (ownerReply) {
+        try {
+          const ownerMsg = buildMessage('text', ownerReply);
+          await lineClient.replyMessage(event.replyToken, [ownerMsg]);
+
+          // messages_log にはトークン入りURLをそのまま残さない（会話ログを見ただけで
+          // 10分間ログインできてしまうのを防ぐ。詳細: services/adminMagicLink.ts）。
+          await db
+            .prepare(
+              `INSERT INTO messages_log (id, friend_id, direction, message_type, content, broadcast_id, scenario_step_id, delivery_type, source, created_at)
+               VALUES (?, ?, 'outgoing', 'text', ?, NULL, NULL, 'reply', 'owner_command', ?)`,
+            )
+            .bind(crypto.randomUUID(), friend.id, redactAdminMagicLinkForLog(ownerReply), jstNow())
+            .run();
+        } catch (err) {
+          console.error('[webhook] owner command reply failed', err);
+        }
+        return;
+      }
+    }
 
     // Cross-account trigger: send message from another account via UUID
     if (incomingText === '体験を完了する' && lineAccountId) {
@@ -591,6 +1185,32 @@ async function handleEvent(
       } catch (err) {
         console.error('Cross-account trigger error:', err);
       }
+    }
+
+    // チャット駆動予約フロー — 進行中のセッションがあれば最優先で処理し、
+    // auto_replies / AI一次応答には進まない（氏名入力等をキーワードマッチや
+    // AI応答に誤って回さないため）。常に replyToken を消費する。
+    const chatBookingSession = await getChatBookingSession(db, friend.id);
+    if (chatBookingSession) {
+      try {
+        await handleChatBookingTextStep(
+          db,
+          lineClient,
+          event.replyToken,
+          friend,
+          chatBookingSession,
+          chatBackendEnv,
+          incomingText,
+        );
+      } catch (err) {
+        console.error('[webhook] chat booking text step failed', err);
+        await clearChatBookingSession(db, friend.id).catch(() => undefined);
+      }
+      await fireEvent(db, 'message_received', {
+        friendId: friend.id,
+        eventData: { text: incomingText, matched: true },
+      }, lineAccessToken, lineAccountId);
+      return;
     }
 
     // 自動返信チェック（このアカウントのルール + グローバルルールのみ）
@@ -665,6 +1285,185 @@ async function handleEvent(
     // auto_replies にマッチしなかった = 自発メッセージ → unread にする
     if (!matched) {
       await upsertChatOnMessage(db, friend.id);
+
+      // 外部チャットバックエンド連携（Ryo限定テストゲート・CHAT_PARITY_TEST_USER_IDS）。
+      // Webチャットと同一プロンプト/予約誘導ロジックで応答する新フロー。ゲート対象外
+      // or バックエンド未設定 or 呼び出し失敗時は、下の既存Gemini単発応答へ完全に
+      // フォールバックする（本番の他ユーザーの挙動には一切影響しない・安全側)。
+      let handledByChatParity = false;
+      if (
+        chatBackendEnv.backendUrl &&
+        chatBackendEnv.backendSecret &&
+        isChatParityEnabled(userId, chatBackendEnv)
+      ) {
+        if (isExplicitBookingIntent(incomingText)) {
+          // ── ユーザー起点の予約導線（STEP1・2026-07-17追加） ──────────────
+          // 「無料相談を予約する」ボタンのタップ、または「予約したい」等の明示的な
+          // 自由文。AIを介さず、決定論的に日付ピッカーFlexへ入る（book判定に依存しない・
+          // services/chatBackend.ts の isExplicitBookingIntent() 参照）。
+          try {
+            const messagesToSend: Message[] = [
+              buildMessage('text', 'かしこまりました。ご希望の日を選んでください。'),
+            ];
+            await appendDayPickerFlexIfAvailable(db, friend, messagesToSend, chatBackendEnv);
+            await lineClient.replyMessage(event.replyToken, messagesToSend);
+            replyTokenConsumed = true;
+            handledByChatParity = true;
+
+            const { messageToLogPayload: logPayloadBookingEntry } = await import('../services/step-delivery.js');
+            for (const sentMsg of messagesToSend) {
+              await logOutgoingMessage(db, friend.id, logPayloadBookingEntry(sentMsg), 'chat_booking_flow');
+            }
+          } catch (err) {
+            console.error('[webhook] explicit booking intent entry failed', err);
+          }
+        } else {
+          const parityStart = Date.now();
+          try {
+            const backendReply = await invokeChatBackend({
+              backendUrl: chatBackendEnv.backendUrl,
+              backendSecret: chatBackendEnv.backendSecret,
+              lineUserId: userId,
+              message: incomingText,
+            });
+            console.log(`[webhook][perf] chat backend invoke: ${Date.now() - parityStart}ms`);
+
+            const messagesToSend: Message[] = [buildMessage('text', backendReply.reply)];
+
+            // 2026-07-17 STEP1変更: 旧仕様はbook=trueで即Flexを出していたが、
+            // 「1問答えただけで予約枠を押し付ける」事故の再発防止のため、book=trueは
+            // 「予約する」クイックリプライボタンを添えるだけに縮小した（Flexが実際に
+            // 出るのは isExplicitBookingIntent() の分岐のみ・上記コメント参照）。
+            //
+            // 2026-07-17追加（毎ターン常時表示化）: satoyama側が選択肢を返さず、かつ
+            // book=falseの場合でも、resolveQuickReplyOptions() が固定の次アクション
+            // （もっと詳しく／別のことを相談する／無料相談を予約する）にフォールバック
+            // するため、quickReplyOptionsが空配列になることはない（chatBackend.ts参照）。
+            const quickReplyOptions = resolveQuickReplyOptions(backendReply.quickReplies, backendReply.book);
+
+            if (backendReply.escalate) {
+              // Ryo宛の通知は satoyama 側で送信済み（契約: docs/line-booking-integration.md §3.3）。
+              // Harness側での追加送信は不要。観測用にログのみ残す。
+              console.log(`[webhook] chat parity escalate=true friendId=${friend.id}`);
+            }
+
+            // satoyama側が選択肢（quickReplies）またはbook=trueを返してきた場合、LINEの
+            // クイックリプライ（タップ選択ボタン）として最後のメッセージに添付する。LINE側の
+            // 仕様上、返信メッセージ配列のうち実際に表示されるクイックリプライは最後の1つの
+            // みのため、常に messagesToSend の末尾（現状は常にテキスト本文のみ）に添付する。
+            // quickReplyOptionsは常に非空（上記フォールバック参照）だが、念のためガードは残す。
+            if (quickReplyOptions.length > 0 && messagesToSend.length > 0) {
+              const items = buildQuickReplyItems(quickReplyOptions);
+              if (items.length > 0) {
+                const lastIndex = messagesToSend.length - 1;
+                messagesToSend[lastIndex] = withQuickReply(messagesToSend[lastIndex], quickReply(items));
+              }
+            }
+
+            await lineClient.replyMessage(event.replyToken, messagesToSend);
+            replyTokenConsumed = true;
+            handledByChatParity = true;
+
+            const { messageToLogPayload: logPayloadChatParity } = await import('../services/step-delivery.js');
+            for (const sentMsg of messagesToSend) {
+              await logOutgoingMessage(db, friend.id, logPayloadChatParity(sentMsg), 'ai_consultation');
+            }
+          } catch (err) {
+            console.error(
+              `[webhook] chat parity backend failed after ${Date.now() - parityStart}ms, sending generic retry fallback`,
+              err,
+            );
+
+            // 2026-07-17 21:42 JST 実機事故の再発防止。
+            // parity対象ユーザーでバックエンド呼び出しが失敗/タイムアウトした際、
+            // 従来は下の「相談窓口 AI 一次応答 (Gemini)」（buildConsultationPrompt）に
+            // そのまま流れ込んでいた。あのプロンプトはOSS汎用の「受付窓口」トーン
+            // 固定文（「担当者が確認のうえ改めてご連絡します」という趣旨で伝える指示）
+            // を持ち、事業固有のポリシー（担当者への取り次ぎを匂わせない等）と衝突しうる
+            // 上、テキストのみでクイックリプライが付かない（このリポジトリは事業固有の
+            // 文面を持たない設計＝上記ファイル冒頭コメント参照。なので新たに事業文言を
+            // ここに書き足すのではなく、既存の汎用フォールバック文
+            // (CONSULTATION_FALLBACK_MESSAGE) を使い、構造的にクイックリプライだけ
+            // 必ず添付する）。
+            try {
+              const fallbackMsg = withQuickReply(
+                buildMessage('text', CONSULTATION_FALLBACK_MESSAGE),
+                quickReply(buildQuickReplyItems(resolveQuickReplyOptions(undefined, false))),
+              );
+              await lineClient.replyMessage(event.replyToken, [fallbackMsg]);
+              replyTokenConsumed = true;
+              handledByChatParity = true;
+
+              const { messageToLogPayload: logPayloadParityFallback } = await import('../services/step-delivery.js');
+              await logOutgoingMessage(db, friend.id, logPayloadParityFallback(fallbackMsg), 'ai_consultation_fallback');
+            } catch (fallbackErr) {
+              // 送信自体も失敗した場合のみ、既存の安全網（下の汎用Geminiフロー）に委ねる。
+              console.error('[webhook] chat parity fallback reply also failed, falling through to legacy consultation', fallbackErr);
+            }
+          }
+        }
+      }
+
+      // 相談窓口 AI 一次応答 (Gemini)。GEMINI_API_KEY 未設定 / レート超過時は何もせず
+      // 従来どおり応答なし (fireEvent 側の通知のみ) にフォールバックする。
+      // LLM生成そのものが失敗/タイムアウト/MAX_TOKENS切れした場合は、中途半端な文を
+      // 送らずに定型フォールバック文 (CONSULTATION_FALLBACK_MESSAGE) を送る
+      // （無応答よりユーザー体験が良く、replyToken を確実に消費できる）。
+      // replyToken を消費した場合のみ replyTokenConsumed=true にし、下の fireEvent には
+      // 渡さない（二重消費防止）。
+      if (!handledByChatParity && geminiApiKey) {
+        // レイテンシ計測（30秒問題の内訳特定用・恒久計装）。D1レート制限クエリ /
+        // Gemini生成 / LINE reply の各区間でどこが支配的かを wrangler tail で
+        // 追えるようにする。本番トラフィック量はレート制限 (60秒3件) で自然に
+        // 抑えられるため常時onでもログ量は問題にならない。
+        const consultationStart = Date.now();
+        try {
+          const rateLimited = await isConsultationRateLimited(db, friend.id);
+          console.log(`[webhook][perf] rateLimit check: ${Date.now() - consultationStart}ms`);
+          if (!rateLimited) {
+            let aiText: string;
+            let logSource: 'ai_consultation' | 'ai_consultation_fallback' = 'ai_consultation';
+            const geminiStart = Date.now();
+            try {
+              const prompt = buildConsultationPrompt(incomingText);
+              aiText = await invokeLLM({ apiKey: geminiApiKey, prompt });
+              console.log(`[webhook][perf] gemini invokeLLM: ${Date.now() - geminiStart}ms`);
+            } catch (llmErr) {
+              console.error(
+                `[webhook] AI consultation generation failed after ${Date.now() - geminiStart}ms, sending fallback text`,
+                llmErr,
+              );
+              aiText = CONSULTATION_FALLBACK_MESSAGE;
+              logSource = 'ai_consultation_fallback';
+            }
+
+            const aiReplyMsg = buildMessage('text', aiText);
+            const lineReplyStart = Date.now();
+            await lineClient.replyMessage(event.replyToken, [aiReplyMsg]);
+            console.log(
+              `[webhook][perf] line replyMessage: ${Date.now() - lineReplyStart}ms / total ai-consultation path: ${Date.now() - consultationStart}ms`,
+            );
+            replyTokenConsumed = true;
+
+            // 送信ログ（他の reply 経路と同じ messages_log 記録パターン）
+            const aiLogId = crypto.randomUUID();
+            const { messageToLogPayload: logPayload3 } = await import('../services/step-delivery.js');
+            const aiReplyPayload = logPayload3(aiReplyMsg);
+            await db
+              .prepare(
+                `INSERT INTO messages_log (id, friend_id, direction, message_type, content, broadcast_id, scenario_step_id, delivery_type, source, created_at)
+                 VALUES (?, ?, 'outgoing', ?, ?, NULL, NULL, 'reply', ?, ?)`,
+              )
+              .bind(aiLogId, friend.id, aiReplyPayload.messageType, aiReplyPayload.content, logSource, jstNow())
+              .run();
+          }
+        } catch (err) {
+          // replyMessage 自体の失敗 (LINE API エラー等) 時は reply 未消費のまま。
+          // replyTokenConsumed は false のままなので、下の fireEvent に replyToken が
+          // そのまま渡り従来動作を維持する。
+          console.error('[webhook] AI consultation reply failed, falling back', err);
+        }
+      }
     }
 
     // イベントバス発火: message_received

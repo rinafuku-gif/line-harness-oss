@@ -119,6 +119,30 @@ export class LineClient {
     return data;
   }
 
+  // ─── Loading Indicator ───────────────────────────────────────────────────
+
+  /**
+   * 1:1トークにローディングアニメーション（くるくる表示）を出す。
+   * https://developers.line.biz/en/docs/messaging-api/use-loading-indicator/
+   *
+   * - 1:1トークのみ対応（グループ/複数人トークは LINE 仕様上不可）。
+   * - ユーザーがそのトーク画面を開いている場合のみ表示される。
+   * - loadingSeconds 経過、または新しい応答メッセージが届くと自動的に消える
+   *   （生成が早く終われば表示もその時点で消える。長めに指定しても実際の
+   *   表示時間は応答が届くまでで打ち切られる）。
+   *
+   * @param chatId 表示先のユーザーID（1:1トークの相手）
+   * @param loadingSeconds 表示上限の目安秒数。LINE 仕様上 5〜60 の範囲のみ有効なため
+   *   範囲外の値は自動的に丸める。
+   */
+  async startLoadingAnimation(chatId: string, loadingSeconds = 20): Promise<void> {
+    const clamped = Math.min(60, Math.max(5, Math.round(loadingSeconds)));
+    await this.request('POST', '/v2/bot/chat/loading/start', {
+      chatId,
+      loadingSeconds: clamped,
+    });
+  }
+
   // ─── Rich Menu ────────────────────────────────────────────────────────────
 
   async getRichMenuList(): Promise<{ richmenus: RichMenuObject[] }> {

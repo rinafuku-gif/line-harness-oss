@@ -7,7 +7,11 @@ import './index.css';
 
 (async () => {
   try {
-    await initLiff();
+    const preview =
+      import.meta.env.DEV &&
+      window.location.pathname === '/onboarding/satoyama' &&
+      new URLSearchParams(window.location.search).get('preview') === '1';
+    if (!preview && !(await initLiff())) return;
     createRoot(document.getElementById('root')!).render(
       <StrictMode>
         <BrowserRouter>
@@ -16,11 +20,15 @@ import './index.css';
       </StrictMode>,
     );
   } catch (err) {
-    document.getElementById('root')!.innerHTML = `
-      <div style="padding: 2rem; font-family: sans-serif; color: #b91c1c;">
-        <h1 style="font-size: 1.25rem; margin-bottom: 1rem;">起動できませんでした</h1>
-        <p>${err instanceof Error ? err.message : String(err)}</p>
-      </div>
-    `;
+    const root = document.getElementById('root')!;
+    const container = document.createElement('div');
+    const heading = document.createElement('h1');
+    const message = document.createElement('p');
+    container.style.cssText = 'padding: 2rem; font-family: sans-serif; color: #b91c1c;';
+    heading.style.cssText = 'font-size: 1.25rem; margin-bottom: 1rem;';
+    heading.textContent = '起動できませんでした';
+    message.textContent = err instanceof Error ? err.message : String(err);
+    container.append(heading, message);
+    root.replaceChildren(container);
   }
 })();

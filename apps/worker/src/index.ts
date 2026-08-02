@@ -1,4 +1,4 @@
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import { cors } from 'hono/cors';
 import { LineClient } from '@line-crm/line-sdk';
 import {
@@ -19,6 +19,8 @@ import { processDueReminders } from './services/booking-reminders.js';
 import { runExpirer } from './services/booking-expirer.js';
 import { processDueEventReminders } from './services/event-booking-reminders.js';
 import { runEventBookingExpirer } from './services/event-booking-expirer.js';
+import { processSatoyamaOnboardingReminders } from './services/satoyama-onboarding-reminder.js';
+import { runSatoyamaOnboardingRetention } from './services/satoyama-onboarding-retention.js';
 import { sendEventBookingNotification } from './services/event-booking-notifier.js';
 import { sendBookingNotification } from './services/booking-notifier.js';
 import { DEFAULT_ACCOUNT_SETTINGS } from './services/booking-types.js';
@@ -64,7 +66,7 @@ import { accountSettings } from './routes/account-settings.js';
 import { setup } from './routes/setup.js';
 import { autoReplies } from './routes/auto-replies.js';
 import { adminAuth } from './routes/admin-auth.js';
-import { resolveCorsOrigin } from './middleware/admin-auth-config.js';
+import { resolveSatoyamaOnboardingCorsOrigin } from './middleware/satoyama-onboarding-cors.js';
 import booking from './routes/booking.js';
 import events from './routes/events.js';
 import { trafficPools } from './routes/traffic-pools.js';
@@ -75,6 +77,8 @@ import { profileRefresh } from './routes/profile-refresh.js';
 import { richMenuGroups } from './routes/rich-menu-groups.js';
 import adminVersion from './routes/admin-version.js';
 import adminUpdate from './routes/admin-update.js';
+import { satoyamaOnboarding } from './routes/satoyama-onboarding.js';
+import { satoyamaCustomers } from './routes/satoyama-customers.js';
 
 export type Env = {
   Bindings: {
@@ -97,6 +101,42 @@ export type Env = {
     X_HARNESS_URL?: string;  // Optional: X Harness API URL for account linking
     IG_HARNESS_URL?: string;  // Optional: IG Harness API URL for cross-platform linking
     IG_HARNESS_LINK_SECRET?: string;  // Shared secret for IG Harness link-line webhook
+    // 相談窓口 AI 一次応答 (webhook.ts の auto_replies 未マッチフォールバック)。
+    // 未設定なら機能自体が無効化され、従来どおり応答なし (upsertChatOnMessage のみ) になる。
+    // Secret は `wrangler secret put GEMINI_API_KEY` で投入する想定。
+    GEMINI_API_KEY?: string;
+    // オーナーコマンド (webhook.ts / services/owner-commands.ts)。カンマ区切りの
+    // LINE userId 一覧。ここに含まれる送信者のみ「管理画面」等の固定コマンドに反応する。
+    // 未設定なら機能自体が無効化される (=誰にも反応しない、安全側デフォルト)。
+    // Secret は `wrangler secret put OWNER_LINE_USER_IDS` で投入する想定
+    // (userId 自体は機密情報ではないが、GEMINI_API_KEY 同様 vars ではなく secret 経由にして
+    // wrangler.toml/リポジトリに残さない)。
+    OWNER_LINE_USER_IDS?: string;
+    // 外部チャットバックエンド連携 (webhook.ts / services/chatBackend.ts)。
+    // 相談窓口AI一次応答をWebチャットと同一人格にするための汎用オプション機能。
+    // CHAT_BACKEND_URL/CHAT_BACKEND_SECRET のどちらかが未設定なら機能自体が無効化され、
+    // 既存の GEMINI_API_KEY 単発フォールバックに完全に倒れる。
+    // Secret は `wrangler secret put CHAT_BACKEND_URL` / `CHAT_BACKEND_SECRET` で投入する想定。
+    CHAT_BACKEND_URL?: string;
+    CHAT_BACKEND_SECRET?: string;
+    // Ryo限定テストゲート — カンマ区切りの line_user_id。ここに含まれる送信者のみ
+    // CHAT_BACKEND_* を使った新フローを使う。他の友だちは従来のGemini単発応答のまま
+    // (=本番の他ユーザーに一切影響しない)。全開放する場合は CHAT_PARITY_ENABLED='all'。
+    // Secret は `wrangler secret put CHAT_PARITY_TEST_USER_IDS` で投入する想定。
+    CHAT_PARITY_TEST_USER_IDS?: string;
+    CHAT_PARITY_ENABLED?: string;
+    // SATOYAMA AI BASE専用の登録直後オンボーディング。機能とaccount_idが
+    // 揃うまでfail-closed。リマインダーはさらに専用flagが必要。
+    SATOYAMA_ONBOARDING_ENABLED?: string;
+    SATOYAMA_ONBOARDING_ACCOUNT_ID?: string;
+    SATOYAMA_ONBOARDING_REMINDER_ENABLED?: string;
+    SATOYAMA_ONBOARDING_RETENTION_ENABLED?: string;
+    // LIFFをWorkerと別originで配信する場合だけ設定する。オンボーディング
+    // APIにのみ許可され、ADMIN_ORIGINの権限へは混ぜない。
+    SATOYAMA_ONBOARDING_ORIGIN?: string;
+    // SATOYAMA Web管理画面から回答者一覧を読むためだけの専用Bearer。
+    // API_KEYとは分離し、未設定時は専用endpointを404で閉じる。
+    SATOYAMA_SITE_READ_TOKEN?: string;
     // Phase 5 self-update — consumed by /admin/update/*. Defaults live in
     // wrangler.toml [vars]; secrets (CF_API_TOKEN, ADMIN_API_KEY) come from
     // `wrangler secret put`. All are optional at the type level so the rest
@@ -126,7 +166,8 @@ const app = new Hono<Env>();
 // else gets no Access-Control-Allow-Origin header (browser blocks it). Bearer
 // SDK/MCP callers send no Origin header and are unaffected.
 app.use('*', cors({
-  origin: (origin, c) => resolveCorsOrigin(c.env, origin, c.req.url),
+  origin: (origin, c) =>
+    resolveSatoyamaOnboardingCorsOrigin(c.env, origin, c.req.url),
   credentials: true,
   allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowHeaders: ['Content-Type', 'Authorization', 'X-CSRF-Token'],
@@ -186,6 +227,8 @@ app.route('/', messageTemplates);
 app.route('/', dedupPreview);
 app.route('/', profileRefresh);
 app.route('/', richMenuGroups);
+app.route('/', satoyamaOnboarding);
+app.route('/', satoyamaCustomers);
 
 // Phase 5 (upgrade flow) — public build metadata endpoint. Mounted under
 // /admin/ but intentionally unauthenticated: the dashboard fetches /admin/version
@@ -539,6 +582,25 @@ ${longPressBlock}
 // Convenience redirect for /book path
 app.get('/book', (c) => c.redirect('/?page=book'));
 
+/**
+ * The LINE LIFF endpoint stays at the Worker root. A direct child-path visit
+ * (used for browser checks and safe explicit links) still needs the same root
+ * shell; the client then mounts only the dedicated onboarding bundle.
+ */
+export async function serveLiffIndex(c: Context<Env>): Promise<Response> {
+  if (!c.env.ASSETS || typeof c.env.ASSETS.fetch !== 'function') {
+    return c.json({ success: false, error: 'Not found' }, 404);
+  }
+  // Request the asset root rather than `/index.html`: both the Vite dev asset
+  // server and Workers Static Assets may canonicalize `/index.html` to `/`.
+  // Returning that redirect would erase the direct onboarding pathname.
+  const indexUrl = new URL('/', c.req.url);
+  return c.env.ASSETS.fetch(new Request(indexUrl, c.req.raw));
+}
+
+app.get('/onboarding/satoyama', serveLiffIndex);
+app.get('/onboarding/satoyama/', serveLiffIndex);
+
 // 404 fallback — API paths return JSON 404, everything else serves from static assets (LIFF/admin)
 export const notFoundHandler = async (c: Parameters<typeof app.notFound>[0] extends (ctx: infer C) => unknown ? C : never) => {
   const path = new URL(c.req.url).pathname;
@@ -651,6 +713,39 @@ async function scheduled(
     } catch (e) {
       console.error('event-booking-expirer error:', e);
     }
+  }
+
+  // SATOYAMA onboarding retention is a separate destructive gate. It only
+  // touches the explicitly configured account, every six hours.
+  if (event.cron === '0 */6 * * *') {
+    try {
+      const result = await runSatoyamaOnboardingRetention(env.DB, {
+        env,
+        now: new Date(),
+      });
+      const changed = Object.values(result).reduce((sum, value) => sum + value, 0);
+      if (changed > 0) {
+        console.log(`[satoyama-onboarding-retention] changed=${changed}`);
+      }
+    } catch {
+      console.error('[satoyama-onboarding-retention] processor failed');
+    }
+  }
+
+  // SATOYAMA friend-add onboarding — disabled unless the account and reminder
+  // flags are both explicit. One claimed reminder is never retried.
+  try {
+    const result = await processSatoyamaOnboardingReminders(env.DB, {
+      env,
+      now: new Date(),
+    });
+    if (result.attempted > 0 || result.skipped > 0) {
+      console.log(
+        `[satoyama-onboarding-reminders] attempted=${result.attempted} sent=${result.sent} failed=${result.failed} skipped=${result.skipped}`,
+      );
+    }
+  } catch {
+    console.error('[satoyama-onboarding-reminders] processor failed');
   }
 
   // Cross-account duplicate detection — disabled.
