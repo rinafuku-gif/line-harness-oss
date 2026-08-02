@@ -560,7 +560,7 @@ async function getEventById(sa: any, eventId: string) {
   const token = await getToken(sa); if (!token) return null;
   const res = await fetch(`https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(CALENDAR_ID)}/events/${eventId}`, { headers: { Authorization: `Bearer ${token}` } });
   const d: any = await res.json(); if (!d || d.error || !d.start?.dateTime) return null;
-  return { title: (d.summary || '').trim(), note: d.description || '', date: jstDate(d.start.dateTime), start: jstHM(d.start.dateTime), end: jstHM(d.end.dateTime) };
+  return { title: (d.summary || '').trim(), note: d.description || '', gLocation: d.location || '', date: jstDate(d.start.dateTime), start: jstHM(d.start.dateTime), end: jstHM(d.end.dateTime) };
 }
 async function fetchWorkshops(sa: any, from: string, to: string) {
   const token = await getToken(sa); if (!token) throw new Error('token failed');
@@ -568,7 +568,7 @@ async function fetchWorkshops(sa: any, from: string, to: string) {
   const data: any = await (await fetch(url, { headers: { Authorization: `Bearer ${token}` } })).json();
   if (data.error) throw new Error(data.error.message || 'calendar error');
   return (data.items || []).filter((e: any) => e.start?.dateTime && (e.summary || '').trim() && !ALL_LOCATION_NAMES.includes((e.summary || '').trim()) && !(e.summary || '').startsWith('【予約】'))
-    .map((e: any) => ({ eventId: e.id, title: (e.summary || '').trim(), date: jstDate(e.start.dateTime), start: jstHM(e.start.dateTime), end: jstHM(e.end.dateTime), note: e.description || '' }));
+    .map((e: any) => ({ eventId: e.id, title: (e.summary || '').trim(), date: jstDate(e.start.dateTime), start: jstHM(e.start.dateTime), end: jstHM(e.end.dateTime), note: e.description || '', gLocation: e.location || '' }));
 }
 bookingGcal.get('/api/liff/booking-gcal/workshops-data', async (c) => {
   try {
@@ -581,7 +581,8 @@ bookingGcal.get('/api/liff/booking-gcal/workshops-data', async (c) => {
       const pm = wsPublicMeta(w.note);
       const cnt: any = await db.prepare(`SELECT COALESCE(SUM(count),0) AS taken FROM pokanto_workshop_apps WHERE workshop_event_id=? AND status IN ('applied','confirmed')`).bind(w.eventId).first();
       const taken = Number(cnt?.taken || 0);
-      out.push({ eventId: w.eventId, title: w.title, date: w.date, start: w.start, end: w.end, place: pm.place, price: pm.price, online: pm.online, desc: pm.desc, capacity: pm.capacity, taken, remaining: pm.capacity != null ? Math.max(0, pm.capacity - taken) : null });
+      const wsPlace = pm.place || (w.gLocation || '').trim();
+      out.push({ eventId: w.eventId, title: w.title, date: w.date, start: w.start, end: w.end, place: wsPlace, price: pm.price, online: pm.online, desc: pm.desc, capacity: pm.capacity, taken, remaining: pm.capacity != null ? Math.max(0, pm.capacity - taken) : null });
     }
     return c.json({ ok: true, workshops: out });
   } catch (err: any) { return c.json({ error: String(err?.message || err) }, 500); }
@@ -625,7 +626,7 @@ bookingGcal.get('/api/liff/booking-gcal/ws-status-data', async (c) => {
     return c.json({
       ok: true, status: app.status, who: app.who, count: app.count,
       title: (ev && ev.title) || app.workshop_title, date: (ev && ev.date) || app.date, start: (ev && ev.start) || '', end: (ev && ev.end) || '',
-      place: meta.place, price: meta.price, online, desc: meta.desc,
+      place: meta.place || (ev?.gLocation || '').trim(), price: meta.price, online, desc: meta.desc,
       url: confirmed && online ? meta.url || '' : '',
     });
   } catch (err: any) { return c.json({ error: String(err?.message || err) }, 500); }
